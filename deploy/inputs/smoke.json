@@ -1,0 +1,1 @@
+{"batch_size": 1, "temperature": 0.0, "max_generate_length": 64, "enable_thinking": false, "requests": [{"messages": [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}]}]}

@@ -1,0 +1,25 @@
+{
+ "batch_size": 1,
+ "temperature": 0.0,
+ "max_generate_length": 128,
+ "enable_thinking": false,
+ "requests": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image",
+       "image": "/zeekr_data/llm/inputs/pics/giant_panda.jpeg"
+      },
+      {
+       "type": "text",
+       "text": "Describe this image in two sentences."
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,1592 @@
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index f629f15..a7c394e 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -1097,7 +1097,15 @@ function(cute_dsl_setup)
+       endforeach()
+ 
+       list(LENGTH _nvfp4_a16_found_variants _nvfp4_a16_found_count)
+-      if(NOT _nvfp4_a16_found_count EQUAL _nvfp4_a16_expected_count)
++      if(NOT _nvfp4_a16_found_count EQUAL _nvfp4_a16_expected_count
++         AND _nvfp4_a16_dtype STREQUAL "bf16")
++        # Thor under CUDA 12.8 (sm_101a) cannot compile the BF16 e2m1 cvt forms;
++        # the runner then only dispatches FP16 activations.
++        message(
++          WARNING
++            "CuTe DSL: BF16 dense W4A16 variants missing (${_nvfp4_a16_missing_variants}); building FP16-only."
++        )
++      elseif(NOT _nvfp4_a16_found_count EQUAL _nvfp4_a16_expected_count)
+         message(
+           FATAL_ERROR
+             "CuTe DSL: incomplete ${_nvfp4_a16_dtype_upper} dense W4A16 artifact set in ${_metadata}.\n"
+@@ -1105,6 +1113,11 @@ function(cute_dsl_setup)
+             "Missing: ${_nvfp4_a16_missing_variants}\n"
+             "Regenerate the nvfp4_a16_blackwell_gemm group with both dtypes and all token tiles."
+         )
++      elseif(_nvfp4_a16_dtype STREQUAL "bf16")
++        foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
++          target_compile_definitions(
++            ${_tgt} PRIVATE "CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED")
++        endforeach()
+       endif()
+ 
+     endforeach()
+diff --git a/cpp/builder/llmBuilder.cpp b/cpp/builder/llmBuilder.cpp
+index e88faab..2860304 100644
+--- a/cpp/builder/llmBuilder.cpp
++++ b/cpp/builder/llmBuilder.cpp
+@@ -28,6 +28,7 @@
+ #include "common/trtUtils.h"
+ #include "common/version.h"
+ 
++#include <filesystem>
+ #include <algorithm>
+ #include <array>
+ #include <cstdlib>
+@@ -786,7 +787,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
+     if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dflash2")
+         || isSpecDecodeDraft(mModelConfig, "jetspec"))
+     {
+-        result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
++        result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile, network);
+         if (!result)
+         {
+             LOG_ERROR("Failed to setup DFlash/DFlash2/JetSpec draft optimization profiles");
+@@ -1276,12 +1277,23 @@ bool LLMBuilder::setupSpecDecodeProfiles(nvinfer1::IOptimizationProfile& context
+     return result;
+ }
+ 
+-bool LLMBuilder::setupDFlashDraftProfiles(
+-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
++bool LLMBuilder::setupDFlashDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
++    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+ {
+     bool result = true;
+ 
+     bool const isDFlash2 = isDFlashV2DraftConfig(mModelConfig);
++    // A LiLiCorr draft carries the correlation lattice outputs; its head reshapes the proposal rows to
++    // [batch, block] with a static block, so the profile must never present fewer rows than one block
++    // (a 2-row min would make the lattice slices empty, which TensorRT's optimizer rejects).
++    bool hasLiLiCorrLattice = false;
++    for (int32_t idx = 0; idx < network.getNbOutputs(); ++idx)
++    {
++        if (std::string_view{network.getOutput(idx)->getName()} == "lilicorr_candidates")
++        {
++            hasLiLiCorrLattice = true;
++        }
++    }
+     int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+     if (isDFlash2 && (maxDraftTokens < 2 || maxDraftTokens > 16))
+     {
+@@ -1305,7 +1317,11 @@ bool LLMBuilder::setupDFlashDraftProfiles(
+     auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile, int64_t optTargetHiddenLen,
+                                int64_t maxTargetHiddenLen) {
+         bool ok = true;
+-        int64_t const minProposalRows = isDFlash2 ? 2 : 1;
++        // A DFlash block always carries at least [anchor, proposal], and drafts with DFlash2-style
++        // grouped conv layers (e.g. LiLiCorr on the V1 contract) derive their block axis as
++        // rows / batch: a min of 1 row with max batch 2 would bound that axis at 0.
++        int64_t const minProposalRows = hasLiLiCorrLattice ? maxDraftTokens : 2;
++        (void) isDFlash2;
+         int64_t const optProposalRows = mBuilderConfig.maxBatchSize * optDraftTokens;
+         int64_t const maxProposalRows = mBuilderConfig.maxBatchSize * maxDraftTokens;
+         int64_t const optDeltaRows = mBuilderConfig.maxBatchSize * optTargetHiddenLen;
+@@ -2507,7 +2523,25 @@ bool LLMBuilder::copyExternalWeightFiles()
+         std::filesystem::path const srcPath = mOnnxDir / filename;
+         std::filesystem::path const dstPath = mEngineDir / dstFilename;
+ 
+-        if (file_io::copyFile(srcPath.string(), dstPath.string()))
++        // Large external weight banks (tens of GB on Thor) must not be duplicated: reuse an existing
++        // identical destination, or hard-link when source and destination share a filesystem.
++        std::error_code linkError;
++        std::filesystem::path const resolvedSrc = std::filesystem::is_symlink(srcPath)
++            ? std::filesystem::canonical(srcPath, linkError)
++            : srcPath;
++        if (std::filesystem::exists(dstPath) && std::filesystem::exists(resolvedSrc)
++            && std::filesystem::file_size(dstPath) == std::filesystem::file_size(resolvedSrc))
++        {
++            LOG_INFO("Reusing existing external weight file: %s", dstFilename.c_str());
++            continue;
++        }
++        linkError.clear();
++        std::filesystem::create_hard_link(resolvedSrc, dstPath, linkError);
++        if (!linkError)
++        {
++            LOG_INFO("Hard-linked external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
++        }
++        else if (file_io::copyFile(srcPath.string(), dstPath.string()))
+         {
+             LOG_INFO("Copied external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
+         }
+diff --git a/cpp/builder/llmBuilder.h b/cpp/builder/llmBuilder.h
+index bdbfedb..495c23f 100644
+--- a/cpp/builder/llmBuilder.h
++++ b/cpp/builder/llmBuilder.h
+@@ -469,8 +469,8 @@ private:
+     //! Set up optimization profiles for DFlash draft models.
+     //! DFlash draft consumes proposal embeddings, dflash_target_hidden_concat,
+     //! dflash_delta_lengths, and per-layer KV cache bindings.
+-    bool setupDFlashDraftProfiles(
+-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
++    bool setupDFlashDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
++        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+ 
+     //! Set up optimization profiles for Gemma4 assistant draft models.
+     //! Gemma4 assistants read base embeddings, target hidden states, target KV,
+diff --git a/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp b/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp
+index cff6068..1cc6ddf 100644
+--- a/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp
++++ b/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp
+@@ -20,6 +20,7 @@
+ #include "kernels/PluginJitKernels/pluginJitCompileCache.h"
+ #include "kernels/PluginJitKernels/pluginJitCompiler.h"
+ 
++#include <cuda_runtime_api.h>
+ #include <array>
+ #include <limits>
+ #include <stdexcept>
+@@ -104,7 +105,12 @@ std::string keyToString(Nvfp4A16BlackwellMoeJitKey const& key)
+ 
+ std::vector<std::string> buildNvrtcOptions(Nvfp4A16BlackwellMoeJitKey const& key)
+ {
+-    return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space", "--gpu-architecture=sm_110a",
++    return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space",
++#if defined(CUDART_VERSION) && CUDART_VERSION < 13000
++        "--gpu-architecture=sm_101a",
++#else
++        "--gpu-architecture=sm_110a",
++#endif
+         "-DNDEBUG", "-DMOE_NUM_EXPERTS=" + std::to_string(key.numExperts), "-DMOE_TOP_K=" + std::to_string(key.topK),
+         "-DMOE_HIDDEN=" + std::to_string(key.hiddenSize), "-DMOE_INTER=" + std::to_string(key.interSize),
+         "-DMOE_INTER_PAD=" + std::to_string(key.interSizePadded), "-DMOE_FC1_SPLIT_K=" + std::to_string(key.fc1SplitK),
+diff --git a/cpp/kernels/nvfp4A16BlackwellGemm/nvfp4A16BlackwellGemmRunner.cpp b/cpp/kernels/nvfp4A16BlackwellGemm/nvfp4A16BlackwellGemmRunner.cpp
+index 9919a3f..02447da 100644
+--- a/cpp/kernels/nvfp4A16BlackwellGemm/nvfp4A16BlackwellGemmRunner.cpp
++++ b/cpp/kernels/nvfp4A16BlackwellGemm/nvfp4A16BlackwellGemmRunner.cpp
+@@ -45,12 +45,14 @@ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_fp16_tm128_tn32_tk64_Kernel_Mo
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_fp16_tm128_tn64_tk64_Kernel_Module_t> gFp16Tm64Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_fp16_tm128_tn128_tk64_Kernel_Module_t> gFp16Tm128Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_fp16_tm128_tn256_tk64_Kernel_Module_t> gFp16Tm256Module{};
++#if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED)
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_Kernel_Module_t> gBf16Tm8Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn16_tk64_Kernel_Module_t> gBf16Tm16Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn32_tk64_Kernel_Module_t> gBf16Tm32Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn64_tk64_Kernel_Module_t> gBf16Tm64Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn128_tk64_Kernel_Module_t> gBf16Tm128Module{};
+ detail::LazyKernelModule<nvfp4_a16_blackwell_gemm_bf16_tm128_tn256_tk64_Kernel_Module_t> gBf16Tm256Module{};
++#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED
+ 
+ cudaError_t currentDeviceInfo(int32_t& smVersion, int32_t& maxActiveClusters) noexcept
+ {
+@@ -98,7 +100,11 @@ bool loadVariant(detail::LazyKernelModule<Module>& module, char const* name, cud
+ 
+ bool dtypeCompiled(Nvfp4A16BlackwellDtype dtype) noexcept
+ {
+-    return dtype == Nvfp4A16BlackwellDtype::kFp16 || dtype == Nvfp4A16BlackwellDtype::kBf16;
++    return dtype == Nvfp4A16BlackwellDtype::kFp16
++#if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED)
++        || dtype == Nvfp4A16BlackwellDtype::kBf16
++#endif
++        ;
+ }
+ 
+ cudaError_t launchSelected(Nvfp4A16BlackwellTokenTile tile, Nvfp4A16BlackwellGemmParams const& params,
+@@ -140,6 +146,7 @@ cudaError_t launchSelected(Nvfp4A16BlackwellTokenTile tile, Nvfp4A16BlackwellGem
+                 gFp16Tm256Module, "nvfp4_a16_blackwell_gemm_fp16_tm128_tn256_tk64", params, maxActiveClusters, stream);
+         }
+     }
++#if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED)
+     if (params.dtype == Nvfp4A16BlackwellDtype::kBf16)
+     {
+         switch (tile)
+@@ -176,6 +183,7 @@ cudaError_t launchSelected(Nvfp4A16BlackwellTokenTile tile, Nvfp4A16BlackwellGem
+                 gBf16Tm256Module, "nvfp4_a16_blackwell_gemm_bf16_tm128_tn256_tk64", params, maxActiveClusters, stream);
+         }
+     }
++#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED
+     return cudaErrorNotSupported;
+ }
+ 
+@@ -206,6 +214,7 @@ cudaError_t loadAllVariants(cudaStream_t stream) noexcept
+                  nvfp4_a16_blackwell_gemm_fp16_tm128_tn256_tk64_Kernel_Module_Unload>(
+                  gFp16Tm256Module, "nvfp4_a16_blackwell_gemm_fp16_tm128_tn256_tk64", stream)
+         && loaded;
++#if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED)
+     loaded = loadVariant<nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_Kernel_Module_Load,
+                  nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_Kernel_Module_Unload>(
+                  gBf16Tm8Module, "nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64", stream)
+@@ -230,6 +239,7 @@ cudaError_t loadAllVariants(cudaStream_t stream) noexcept
+                  nvfp4_a16_blackwell_gemm_bf16_tm128_tn256_tk64_Kernel_Module_Unload>(
+                  gBf16Tm256Module, "nvfp4_a16_blackwell_gemm_bf16_tm128_tn256_tk64", stream)
+         && loaded;
++#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_BF16_ENABLED
+     return loaded ? cudaSuccess : cudaErrorInitializationError;
+ }
+ #endif // CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_ENABLED
+@@ -296,7 +306,7 @@ bool Nvfp4A16BlackwellGemmRunner::isSupported(int32_t smVersion, Nvfp4A16Blackwe
+     {
+         return false;
+     }
+-    if (dtype != Nvfp4A16BlackwellDtype::kFp16 && dtype != Nvfp4A16BlackwellDtype::kBf16)
++    if (!dtypeCompiled(dtype))
+     {
+         return false;
+     }
+@@ -353,7 +363,7 @@ cudaError_t Nvfp4A16BlackwellGemmRunner::run(
+     {
+         return cudaErrorInvalidValue;
+     }
+-    if (params.dtype != Nvfp4A16BlackwellDtype::kFp16 && params.dtype != Nvfp4A16BlackwellDtype::kBf16)
++    if (!dtypeCompiled(params.dtype))
+     {
+         return cudaErrorInvalidValue;
+     }
+diff --git a/cpp/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitCompiler.cpp b/cpp/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitCompiler.cpp
+index a19efb3..34fd2f9 100644
+--- a/cpp/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitCompiler.cpp
++++ b/cpp/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitCompiler.cpp
+@@ -21,6 +21,8 @@
+ #include "kernels/PluginJitKernels/pluginJitCompileCache.h"
+ #include "kernels/PluginJitKernels/pluginJitCompiler.h"
+ 
++#include <cuda_runtime_api.h>
++
+ #include <array>
+ #include <limits>
+ #include <stdexcept>
+@@ -102,7 +104,12 @@ std::string keyToString(Nvfp4A16BlackwellGemvJitKey const& key)
+ 
+ std::vector<std::string> buildNvrtcOptions(Nvfp4A16BlackwellGemvJitKey const& key)
+ {
+-    return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space", "--gpu-architecture=sm_110a",
++    return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space", 
++#if defined(CUDART_VERSION) && CUDART_VERSION < 13000
++        "--gpu-architecture=sm_101a",
++#else
++        "--gpu-architecture=sm_110a",
++#endif
+         "-DNDEBUG", "-DGEMV_N=" + std::to_string(key.n), "-DGEMV_K=" + std::to_string(key.k),
+         "-DGEMV_DATA_TYPE=" + std::to_string(static_cast<uint32_t>(key.dataType)),
+         "-DGEMV_LAYOUT_ABI=" + std::to_string(key.layout), "-DGEMV_SOURCE_ABI=" + std::to_string(key.sourceAbi)};
+diff --git a/cpp/kernels/nvfp4A16BlackwellSupport.h b/cpp/kernels/nvfp4A16BlackwellSupport.h
+index dae8cd0..47edb51 100644
+--- a/cpp/kernels/nvfp4A16BlackwellSupport.h
++++ b/cpp/kernels/nvfp4A16BlackwellSupport.h
+@@ -20,10 +20,17 @@
+ #include <cstdint>
+ #include <limits>
+ 
++#include <cuda_runtime_api.h>
++
+ namespace trt_edgellm::nvfp4_a16_blackwell
+ {
+ 
++// Thor is SM110 under CUDA 13 but SM101 under CUDA 12.x (same silicon, renumbered). Follow the toolkit.
++#if defined(CUDART_VERSION) && CUDART_VERSION < 13000
++inline constexpr int32_t kTargetSm{101};
++#else
+ inline constexpr int32_t kTargetSm{110};
++#endif
+ inline constexpr int32_t kNTile{128};
+ inline constexpr int32_t kKTile{64};
+ 
+diff --git a/cpp/plugins/nvfp4A16BlackwellMoePlugin/nvfp4A16BlackwellMoePlugin.cpp b/cpp/plugins/nvfp4A16BlackwellMoePlugin/nvfp4A16BlackwellMoePlugin.cpp
+index 1379b72..c7b9967 100644
+--- a/cpp/plugins/nvfp4A16BlackwellMoePlugin/nvfp4A16BlackwellMoePlugin.cpp
++++ b/cpp/plugins/nvfp4A16BlackwellMoePlugin/nvfp4A16BlackwellMoePlugin.cpp
+@@ -292,10 +292,11 @@ void Nvfp4A16BlackwellMoePlugin::validateAttributes() const
+     {
+         throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: backend must be 0 (auto), 1 (decode) or 2 (prefill)");
+     }
+-    if (std::find(std::begin(kSupportedNumExperts), std::end(kSupportedNumExperts), mNumExperts)
+-        == std::end(kSupportedNumExperts))
++    // The CuTe DSL FC1/FC2 cubins and the routing/layout kernels are runtime-polymorphic in the expert count;
++    // heterogeneous stacks such as Nemotron 3.5 Bolt use 240..496 experts per layer. Keep the kernel's hard cap.
++    if (mNumExperts <= 0 || mNumExperts > kSupportedNumExperts[sizeof(kSupportedNumExperts) / sizeof(int32_t) - 1])
+     {
+-        throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: num_experts must be one of {128, 256, 512}");
++        throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: num_experts must be in [1, 512]");
+     }
+     if (mTopK <= 0 || mTopK > kMaxTopK || mTopK > mNumExperts)
+     {
+diff --git a/cpp/runtime/decoding/dflashDecoder.cpp b/cpp/runtime/decoding/dflashDecoder.cpp
+index 8864cbb..ed95a06 100644
+--- a/cpp/runtime/decoding/dflashDecoder.cpp
++++ b/cpp/runtime/decoding/dflashDecoder.cpp
+@@ -17,6 +17,12 @@
+ 
+ #include "runtime/decoding/dflashDecoder.h"
+ 
++#include <cmath>
++#include <cstdlib>
++#include <cuda_fp16.h>
++#include <limits>
++#include <vector>
++
+ #include "common/bindingNames.h"
+ #include "common/checkMacros.h"
+ #include "common/cudaUtils.h"
+@@ -128,6 +134,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
+     mDraftTensorMap.set(binding_names::kInputsEmbeds, mDraftInputsEmbeds);
+     mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
+     mDraftTensorMap.set(binding_names::kLogits, mDraftOutputLogits);
++    initLiLiCorrLattice(maxBatch);
+     mDraftTensorMap.set(binding_names::kAttentionMask, mDraftPackedAttentionMask);
+     mDraftTensorMap.set(binding_names::kAttentionPosId, mDraftAttentionPosId);
+     initializeDraftRaggedBindings(draftCfg);
+@@ -288,6 +295,124 @@ DecodingKvHeadroom DFlashDecoder::requiredKvHeadroom() const
+     return {mBlockDraft.verifySize, mBlockDraft.blockSize};
+ }
+ 
++namespace
++{
++template <typename T>
++void dflashDebugStats(char const* label, Tensor const& t, int64_t rows, int64_t cols, cudaStream_t stream)
++{
++    std::vector<T> host(static_cast<size_t>(rows) * cols);
++    cudaStreamSynchronize(stream);
++    cudaMemcpy(host.data(), t.rawPointer(), host.size() * sizeof(T), cudaMemcpyDeviceToHost);
++    for (int64_t r = 0; r < rows; ++r)
++    {
++        double sumAbs = 0.0, maxAbs = 0.0;
++        int64_t nans = 0, infs = 0, argmax = 0;
++        float best = -std::numeric_limits<float>::infinity();
++        for (int64_t c = 0; c < cols; ++c)
++        {
++            float const v = static_cast<float>(host[r * cols + c]);
++            if (std::isnan(v)) { ++nans; continue; }
++            if (std::isinf(v)) { ++infs; continue; }
++            float const a = std::fabs(v);
++            sumAbs += a;
++            if (a > maxAbs) maxAbs = a;
++            if (v > best) { best = v; argmax = c; }
++        }
++        LOG_INFO("[dflash-debug] %s row %ld: cols=%ld nan=%ld inf=%ld meanAbs=%.4g maxAbs=%.4g argmax=%ld (%.4g)",
++            label, static_cast<long>(r), static_cast<long>(cols), static_cast<long>(nans), static_cast<long>(infs),
++            sumAbs / static_cast<double>(cols), maxAbs, static_cast<long>(argmax), best);
++    }
++}
++} // namespace
++
++void DFlashDecoder::debugDumpDraftStats(cudaStream_t stream)
++{
++    int64_t const bs = mBlockDraft.blockSize;
++    dflashDebugStats<half>("inputsEmbeds", mDraftInputsEmbeds, bs, mBlockDraft.draftHiddenSize, stream);
++    dflashDebugStats<half>("targetHidden", mDraftTargetHidden, std::min<int64_t>(bs, 2), mBlockDraft.baseOutputHiddenDim, stream);
++    dflashDebugStats<half>("baseHiddenStates", mRuntime.base.pipelineIO.baseHiddenStates, 2, mBlockDraft.baseOutputHiddenDim, stream);
++    dflashDebugStats<float>("draftLogits", mDraftOutputLogits, bs, mBlockDraft.draftVocabSize, stream);
++    std::vector<int32_t> ids(static_cast<size_t>(bs));
++    cudaMemcpy(ids.data(), mHostDraftInputIds.rawPointer(), ids.size() * sizeof(int32_t), cudaMemcpyHostToHost);
++    std::string s;
++    for (auto id : ids) { s += std::to_string(id) + " "; }
++    LOG_INFO("[dflash-debug] draft input ids: %s", s.c_str());
++}
++
++void DFlashDecoder::initLiLiCorrLattice(int32_t maxBatch)
++{
++    if (!mDraftExecutor)
++    {
++        return;
++    }
++    auto const& engine = mDraftExecutor->getEngine();
++    bool found = false;
++    for (int32_t i = 0; i < engine.getNbIOTensors(); ++i)
++    {
++        if (std::string(engine.getIOTensorName(i)) == "lilicorr_candidates")
++        {
++            found = true;
++        }
++    }
++    if (!found)
++    {
++        return;
++    }
++    nvinfer1::Dims const candDims = engine.getTensorShape("lilicorr_candidates");
++    mLiLiTopK = candDims.d[candDims.nbDims - 1];
++    int32_t const slots = mBlockDraft.blockSize - 1;
++    check::check(mLiLiTopK > 0 && slots > 0, "LiLiCorr lattice: invalid top-k or block size");
++    mLiLiCandidates = Tensor({maxBatch, slots, mLiLiTopK}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
++        "DFlashDraft::lilicorrCandidates");
++    mLiLiScores = Tensor({maxBatch, slots, mLiLiTopK, mLiLiTopK}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
++        "DFlashDraft::lilicorrScores");
++    mDraftTensorMap.set("lilicorr_candidates", mLiLiCandidates);
++    mDraftTensorMap.set("lilicorr_scores", mLiLiScores);
++    mHostLiLiCandidates.resize(static_cast<size_t>(maxBatch) * slots * mLiLiTopK);
++    mHostLiLiScores.resize(static_cast<size_t>(maxBatch) * slots * mLiLiTopK * mLiLiTopK);
++    mHostLiLiDraftIds.resize(static_cast<size_t>(maxBatch) * mBlockDraft.blockSize);
++    mHasLiLiCorr = true;
++    LOG_INFO("DFlashDecoder: LiLiCorr lattice enabled (top-k=%d, slots=%d)", mLiLiTopK, slots);
++}
++
++void DFlashDecoder::applyLiLiCorrLattice(int32_t activeBatchSize, cudaStream_t stream)
++{
++    int32_t const bs = mBlockDraft.blockSize;
++    int32_t const slots = bs - 1;
++    int32_t const k = mLiLiTopK;
++    size_t const nCand = static_cast<size_t>(activeBatchSize) * slots * k;
++    size_t const nScores = nCand * k;
++    size_t const nIds = static_cast<size_t>(activeBatchSize) * bs;
++    CUDA_CHECK(cudaMemcpyAsync(mHostLiLiCandidates.data(), mLiLiCandidates.rawPointer(), nCand * sizeof(int32_t),
++        cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaMemcpyAsync(mHostLiLiScores.data(), mLiLiScores.rawPointer(), nScores * sizeof(float),
++        cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaMemcpyAsync(mHostLiLiDraftIds.data(), mDraftTokenIds.rawPointer(), nIds * sizeof(int32_t),
++        cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    for (int32_t b = 0; b < activeBatchSize; ++b)
++    {
++        int32_t pred = 0;
++        for (int32_t s = 0; s < slots; ++s)
++        {
++            float const* row = mHostLiLiScores.data() + ((static_cast<size_t>(b) * slots + s) * k + pred) * k;
++            int32_t best = 0;
++            for (int32_t c = 1; c < k; ++c)
++            {
++                if (row[c] > row[best])
++                {
++                    best = c;
++                }
++            }
++            pred = best;
++            mHostLiLiDraftIds[static_cast<size_t>(b) * bs + 1 + s]
++                = mHostLiLiCandidates[(static_cast<size_t>(b) * slots + s) * k + pred];
++        }
++    }
++    CUDA_CHECK(cudaMemcpyAsync(mDraftTokenIds.rawPointer(), mHostLiLiDraftIds.data(), nIds * sizeof(int32_t),
++        cudaMemcpyHostToDevice, stream));
++}
++
+ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
+ {
+     NVTX_SCOPED_RANGE(nvtx_dflash_draft, "DFlashDecoder::runDraftForward", nvtx_colors::DARK_ORANGE);
+@@ -452,6 +577,11 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
+         check::check(
+             mDraftOutputLogits.reshape({activeBatchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
+     }
++    if (mHasLiLiCorr)
++    {
++        check::check(mLiLiCandidates.reshape({activeBatchSize, BS - 1, mLiLiTopK}), "Tensor reshape failed");
++        check::check(mLiLiScores.reshape({activeBatchSize, BS - 1, mLiLiTopK, mLiLiTopK}), "Tensor reshape failed");
++    }
+     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
+     InferenceDims const draftDims{
+         /*.batch=*/activeBatchSize,
+@@ -508,6 +638,10 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
+ 
+ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& context)
+ {
++    if (std::getenv("EDGELLM_DFLASH_DEBUG_STATS") != nullptr)
++    {
++        debugDumpDraftStats(context.stream);
++    }
+     if (isV2())
+     {
+         return prepareV2Proposal(context);
+@@ -533,6 +667,10 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
+             mapReducedVocabToFullVocab(mDraftTokenIds, mDraftVocabMappingTable, context.stream);
+             check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.blockSize}), "Tensor reshape failed");
+         }
++        if (mHasLiLiCorr && std::getenv("EDGELLM_LILICORR_OFF") == nullptr)
++        {
++            applyLiLiCorrLattice(activeBatchSize, context.stream);
++        }
+         kernel::launchDFlashBuildLinearVerifyInputs(mLastAcceptedTokens.dataPointer<int32_t>(),
+             mDraftTokenIds.dataPointer<int32_t>(), mVerifyTokenIds.dataPointer<int32_t>(),
+             mVerifyTreeMask.dataPointer<int8_t>(), activeBatchSize, mBlockDraft.proposalLen, mBlockDraft.blockSize,
+@@ -641,6 +779,11 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
+             {
+                 check::check(
+                     mDraftOutputLogits.reshape({batchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
++                if (mHasLiLiCorr)
++                {
++                    check::check(mLiLiCandidates.reshape({batchSize, BS - 1, mLiLiTopK}), "Tensor reshape failed");
++                    check::check(mLiLiScores.reshape({batchSize, BS - 1, mLiLiTopK, mLiLiTopK}), "Tensor reshape failed");
++                }
+             }
+             check::check(mDraftPackedAttentionMask.reshape({batchSize, BS, pmLen}), "Tensor reshape failed");
+             check::check(mDraftAttentionPosId.reshape({batchSize, BS}), "Tensor reshape failed");
+diff --git a/cpp/runtime/decoding/dflashDecoder.h b/cpp/runtime/decoding/dflashDecoder.h
+index 4fcd01d..3480fa1 100644
+--- a/cpp/runtime/decoding/dflashDecoder.h
++++ b/cpp/runtime/decoding/dflashDecoder.h
+@@ -92,6 +92,19 @@ private:
+     void initializeDFlash2(
+         std::filesystem::path const& engineDir, ExternalWeightManager draftWeights, cudaStream_t stream);
+     bool runDraftForward(DecodingInferenceContext& context);
++    //! Debug helper (EDGELLM_DFLASH_DEBUG_STATS): per-row NaN/magnitude/argmax of draft I/O.
++    void debugDumpDraftStats(cudaStream_t stream);
++    //! LiLiCorr lattice (draft engine outputs lilicorr_candidates [B, slots, K] / lilicorr_scores [B, slots, K, K]):
++    //! greedy walk replaces the per-slot argmax proposals.
++    void initLiLiCorrLattice(int32_t maxBatch);
++    void applyLiLiCorrLattice(int32_t activeBatchSize, cudaStream_t stream);
++    bool mHasLiLiCorr{false};
++    int32_t mLiLiTopK{0};
++    Tensor mLiLiCandidates;      //!< [B, slots, K] INT32 GPU
++    Tensor mLiLiScores;          //!< [B, slots, K, K] FP32 GPU
++    std::vector<int32_t> mHostLiLiCandidates;
++    std::vector<float> mHostLiLiScores;
++    std::vector<int32_t> mHostLiLiDraftIds;
+     bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context);
+     bool prepareV2Proposal(DecodingInferenceContext& context);
+     bool captureDraftCudaGraphs(cudaStream_t stream);
+diff --git a/kernelSrcs/build_cutedsl.py b/kernelSrcs/build_cutedsl.py
+index 370fb6b..f6ae921 100644
+--- a/kernelSrcs/build_cutedsl.py
++++ b/kernelSrcs/build_cutedsl.py
+@@ -1968,7 +1968,9 @@ for _io_dtype in _NVFP4_A16_BLACKWELL_DTYPES:
+                     f"tm128_tn{_token_tile}_tk64"
+                 ),
+                 group="nvfp4_a16_blackwell_gemm",
+-                supported_sms=[110],
++                # CUDA 12.8 ptxas for sm_101a lacks the bf16 e2m1 cvt forms;
++                # Thor (SM101) only gets the fp16 I/O dense variants.
++                supported_sms=([101, 110] if _io_dtype == "fp16" else [110]),
+                 script=(
+                     "nvfp4_a16_blackwell_gemm/"
+                     "nvfp4_a16_blackwell_gemm.py"
+@@ -2015,7 +2017,7 @@ for _fusion_tag, _fusion_arg in _NVFP4_A16_BLACKWELL_MOE_FUSIONS:
+                     name=(f"nvfp4_a16_blackwell_moe_{_fusion_tag}_{_io_dtype}_"
+                           f"tm128_tn{_token_tile}_tk64"),
+                     group="nvfp4_a16_blackwell_moe",
+-                    supported_sms=[110],
++                    supported_sms=[101, 110],
+                     script=("nvfp4_a16_blackwell_moe/"
+                             "nvfp4_a16_blackwell_moe_gemm.py"),
+                     script_args=[
+diff --git a/tensorrt_edgellm/_export_api.py b/tensorrt_edgellm/_export_api.py
+index b8bfb80..3f2a79d 100644
+--- a/tensorrt_edgellm/_export_api.py
++++ b/tensorrt_edgellm/_export_api.py
+@@ -103,6 +103,8 @@ register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM,
+                standard_attention_scale)
+ register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM,
+                standard_attention_scale)
++register_model("NemotronH_Omni_Reasoning_V3", NemotronHCausalLM,
++               standard_attention_scale)
+ # Qwen3-Omni thinker needs an extra ``hidden_states`` ONNX output for the
+ # Talker hidden_states emission. Cover every model_type string that can appear in the
+ # thinker's config.json across HF / exported variants.
+diff --git a/tensorrt_edgellm/config.py b/tensorrt_edgellm/config.py
+index c1e2453..273f473 100644
+--- a/tensorrt_edgellm/config.py
++++ b/tensorrt_edgellm/config.py
+@@ -855,6 +855,9 @@ class ModelConfig:
+     moe_shared_expert_intermediate_size: int = 0
+     # Optional latent dimension used by Nemotron-H routed experts.
+     moe_latent_size: Optional[int] = None
++    # Per-layer MoE overrides for heterogeneous (Puzzle / Star-Elastic) stacks such as
++    # Nemotron 3.5 Bolt: {layer_idx: {"n_routed_experts", "moe_intermediate_size", "num_experts_per_tok"}}.
++    moe_layer_configs: Dict[int, dict] = field(default_factory=dict)
+     routed_scaling_factor: float = 1.0
+     n_group: int = 1
+     topk_group: int = 1
+@@ -1251,6 +1254,21 @@ class ModelConfig:
+         # than ``num_experts`` / ``num_local_experts``; treat either as MoE so
+         # the sizes below are parsed instead of defaulting to 0.
+         n_routed_experts = int(llm_dict.get("n_routed_experts", 0) or 0)
++        # Heterogeneous MoE stacks (``block_configs`` per layer): fill the global
++        # sizes with the per-layer maxima; the per-layer values are applied in
++        # the model via ``moe_layer_configs``.
++        moe_layer_configs = _parse_moe_block_configs(llm_dict)
++        if moe_layer_configs:
++            if n_routed_experts <= 0:
++                n_routed_experts = max(
++                    v.get("n_routed_experts", 0)
++                    for v in moe_layer_configs.values())
++            if not llm_dict.get("moe_intermediate_size"):
++                llm_dict = dict(
++                    llm_dict,
++                    moe_intermediate_size=max(
++                        v.get("moe_intermediate_size", 0)
++                        for v in moe_layer_configs.values()))
+         if num_experts > 0 or n_routed_experts > 0:
+             num_experts_per_tok = int(
+                 llm_dict.get("num_experts_per_tok",
+@@ -1394,6 +1412,7 @@ class ModelConfig:
+             eagle3_target_layer_ids=eagle3_target_layer_ids,
+             num_experts=num_experts,
+             n_routed_experts=n_routed_experts,
++            moe_layer_configs=moe_layer_configs,
+             num_experts_per_tok=num_experts_per_tok,
+             moe_intermediate_size=moe_intermediate_size,
+             moe_shared_expert_intermediate_size=
+@@ -1964,6 +1983,23 @@ def _validate_mtp_constraints(
+             "Dedicated MTP embeddings are not supported for Qwen3.5 MTP.")
+ 
+ 
++def _parse_moe_block_configs(llm_dict: dict) -> Dict[int, dict]:
++    """Per-layer MoE sizes from a NemotronH-Puzzle ``block_configs`` list."""
++    out: Dict[int, dict] = {}
++    for i, bc in enumerate(llm_dict.get("block_configs") or []):
++        if not isinstance(bc, dict) or str(bc.get("block_type",
++                                                  "")).lower() != "moe":
++            continue
++        entry = {
++            k: int(bc[k])
++            for k in ("n_routed_experts", "moe_intermediate_size",
++                      "num_experts_per_tok") if bc.get(k) is not None
++        }
++        if entry:
++            out[i] = entry
++    return out
++
++
+ def _parse_raw_layer_types(config: dict) -> List[str]:
+     """Return checkpoint layer type strings without canonicalization."""
+     raw = config.get("layers_block_type") or config.get("layer_types")
+@@ -2671,6 +2707,10 @@ def _algo_to_quant_type(algo: str) -> str:
+         return QUANT_MXFP8
+     if "FP8" in algo:
+         return QUANT_FP8
++    # Weight-only NVFP4 (ModelOpt ``W4A16_NVFP4``) carries no activation scales:
++    # it is the A16 path for every model family, not just Nemotron-H.
++    if "W4A16" in algo and ("FP4" in algo or "NVFP4" in algo):
++        return QUANT_NVFP4_A16
+     if "FP4" in algo or "NVFP4" in algo:
+         return QUANT_NVFP4
+     # W4A16_AWQ from ModelOpt unified checkpoints uses prepacked uint8 weights;
+diff --git a/tensorrt_edgellm/external_weights.py b/tensorrt_edgellm/external_weights.py
+index bce8b2a..1165baf 100644
+--- a/tensorrt_edgellm/external_weights.py
++++ b/tensorrt_edgellm/external_weights.py
+@@ -175,7 +175,8 @@ def _find_int4_moe_weight_initializers(onnx_model) -> "list[str]":
+ def _find_nvfp4_moe_weight_initializers(onnx_model) -> "list[str]":
+     """Return NVFP4 MoE plugin initializer inputs."""
+     initializers = {init.name for init in onnx_model.graph.initializer}
+-    plugin_op_types = {"Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"}
++    plugin_op_types = {"Nvfp4MoePlugin", "NvFP4MoEPluginGeforce",
++                       "Nvfp4A16BlackwellMoePlugin", "Nvfp4A16MoePlugin"}
+ 
+     external_names: list[str] = []
+     external_name_set: set[str] = set()
+diff --git a/tensorrt_edgellm/model.py b/tensorrt_edgellm/model.py
+index e9f3860..e8e4db3 100644
+--- a/tensorrt_edgellm/model.py
++++ b/tensorrt_edgellm/model.py
+@@ -569,6 +569,50 @@ class AutoModel:
+             if not draft_has_lm_head:
+                 config = _inherit_dflash_lm_head_quant(config, base_config)
+             model_class = DFlashDraftModel
++            # LiLiCorr (Nemotron 3.5 Bolt drafter): DFlash2-shaped conv layers with
++            # sliding-window attention and learned sinks, run on the V1 contract.
++            _lili_root, _lili_llm = load_checkpoint_config_dicts(
++                dflash_draft_dir)
++            _lili_archs = set(_lili_root.get("architectures") or []) | set(
++                _lili_llm.get("architectures") or [])
++            if "LiLiCorrDraftModel" in _lili_archs:
++                from .models.lilicorr import LiLiCorrDraftModel
++                model_class = LiLiCorrDraftModel
++                config.attention_sink_bias = bool(
++                    _lili_llm.get(
++                        "attention_sink_bias",
++                        _lili_root.get("attention_sink_bias", False)))
++                _lili_dflash = (_lili_root.get("dflash_config")
++                                or _lili_llm.get("dflash_config") or {})
++                config.lilicorr_no_conv = bool(_lili_dflash.get("no_conv", False))
++                config.lilicorr_scale_fold = dict(
++                    _lili_dflash.get("lilicorr_scale_fold") or {})
++                config.lilicorr_head = {}
++                try:
++                    from safetensors import safe_open as _lili_so
++                    with _lili_so(os.path.join(dflash_draft_dir, "model.safetensors"), "pt") as _lf:
++                        _lili_has_head = "lilicorr.token_proj.weight" in _lf.keys()
++                except Exception:  # noqa: BLE001
++                    _lili_has_head = False
++                if _lili_has_head and _lili_dflash.get("lilicorr_enabled", True):
++                    config.lilicorr_head = {
++                        k: _lili_dflash[k] for k in _lili_dflash if k.startswith("lilicorr_")
++                    }
++                    config.lilicorr_base_embedding_dir = base_model_dir
++                # A dense (FP16/BF16) fc in the draft checkpoint means the FP32
++                # projection path; only a quantized fc runs at native precision.
++                try:
++                    from safetensors import safe_open as _lili_safe_open
++                    with _lili_safe_open(
++                            os.path.join(dflash_draft_dir, "model.safetensors"),
++                            "pt") as _lili_f:
++                        _lili_fc_dtype = _lili_f.get_slice("fc.weight").get_dtype()
++                except Exception:  # noqa: BLE001
++                    _lili_fc_dtype = ""
++                if _lili_fc_dtype in ("F16", "BF16", "F32"):
++                    config.dflash_fc_native_precision = False
++                    if "fc" not in config.quant.excluded:
++                        config.quant.excluded = list(config.quant.excluded) + ["fc"]
+             model_dir = dflash_draft_dir
+             if key_remap is None:
+                 key_remap = (_muse_glimmer_dflash_key_remap
+@@ -771,6 +815,8 @@ class AutoModel:
+                      key_prefix=key_prefix,
+                      pre_repack_hook=pre_repack_hook,
+                      mapping=config.mapping)
++        if getattr(config, "lilicorr_head", None) and hasattr(model, "lilicorr_embed_table"):
++            _load_lilicorr_embed_table(model, getattr(config, "lilicorr_base_embedding_dir", model_dir), device)
+         if low_cpu_mem_usage:
+             _materialize_checkpoint_defaults(model, device)
+             _materialize_optional_scale_buffers(model, device)
+@@ -1261,3 +1307,23 @@ def _mtp_key_remap(key: str,
+             "model.language_model.embed_tokens.weight"):
+         return "lm_head.weight"
+     return None
++
++
++def _load_lilicorr_embed_table(model: nn.Module, base_model_dir: str, device: str) -> None:
++    """Copy the base model's token embedding into the LiLiCorr head (shared embeddings)."""
++    from safetensors import safe_open
++
++    from .checkpoint.loader import _build_shard_map
++    shard_map = _build_shard_map(base_model_dir)
++    for key in ("language_model.backbone.embeddings.weight", "backbone.embeddings.weight",
++                "model.embed_tokens.weight", "language_model.model.embed_tokens.weight"):
++        if key in shard_map:
++            with safe_open(shard_map[key], "pt", device="cpu") as f:
++                table = f.get_tensor(key)
++            param = model.lilicorr_embed_table
++            if tuple(table.shape) != tuple(param.shape):
++                raise ValueError(f"LiLiCorr embedding table shape {tuple(table.shape)} != {tuple(param.shape)}")
++            param.data = table.to(param.dtype).to(device)
++            logging.getLogger(__name__).info("LiLiCorr head: embedding table from %s (%s)", key, base_model_dir)
++            return
++    raise ValueError("LiLiCorr head: base embedding table not found in " + base_model_dir)
+diff --git a/tensorrt_edgellm/models/lilicorr/__init__.py b/tensorrt_edgellm/models/lilicorr/__init__.py
+new file mode 100644
+index 0000000..73960e2
+--- /dev/null
++++ b/tensorrt_edgellm/models/lilicorr/__init__.py
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LiLiCorr draft model (DFlash V1 contract with DFlash2 layers, SWA and attention sinks)."""
++from .modeling_lilicorr_draft import LiLiCorrDecoderLayer, LiLiCorrDraftModel
++
++__all__ = ["LiLiCorrDecoderLayer", "LiLiCorrDraftModel"]
+diff --git a/tensorrt_edgellm/models/lilicorr/lilicorr_head.py b/tensorrt_edgellm/models/lilicorr/lilicorr_head.py
+new file mode 100644
+index 0000000..fea18a3
+--- /dev/null
++++ b/tensorrt_edgellm/models/lilicorr/lilicorr_head.py
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LiLiCorr correlation head (arXiv 2608.20530) as a torch module exportable inside the draft graph.
++
++Semantics follow the llama.cpp reference (src/models/dflash.cpp::build_lilicorr_scores):
++
++* per drafted slot s = 1..block-1 take the top-k draft candidates (sorted by logit),
++* build node states: token_proj(embed[cand]) + pass_hidden_proj(draft hidden of the slot)
++  + feature_mlp(LayerNorm([log p, p, log p - log p_top, rank/(k-1), rank==0])) + slot/rank embeddings,
++* run two small transformer layers over the (block-1)*k nodes with a per-head additive bias that depends on
++  the slot distance (relative_slot_bias) and a same-slot term,
++* factor = silu(factor_input_proj([x, anchor, x*anchor])); in = l2norm(in_head(factor)); out = l2norm(out_head(factor)),
++* scores: slot 1 vs anchor_out (anchor = context_proj(fused target hidden of the anchor token)),
++  slot s vs out of slot s-1, scaled by logit_scale.
++
++Outputs ``candidates`` [B, slots, k] int32 and ``scores`` [B, slots, k, k] fp32 (slot 0 valid only in column
++block [:, 0, 0, :]); the runtime walks the lattice greedily: pred=0; for s: pred = argmax(scores[s, pred]).
++"""
++import os
++from typing import Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++class _RMSNorm(nn.Module):
++
++    def __init__(self, size: int, eps: float) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(size, dtype=torch.float16), requires_grad=False)
++        self.eps = eps
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = x.to(torch.float32)
++        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
++        return x * self.weight.to(torch.float32)
++
++
++class _Linear(nn.Module):
++    """FP16 weights, FP32 compute (the head is tiny: at most 56 rows)."""
++
++    def __init__(self, in_f: int, out_f: int, bias: bool = True) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.zeros(out_f, in_f, dtype=torch.float16), requires_grad=False)
++        self.bias = nn.Parameter(torch.zeros(out_f, dtype=torch.float16), requires_grad=False) if bias else None
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        b = self.bias.to(torch.float32) if self.bias is not None else None
++        return F.linear(x.to(torch.float32), self.weight.to(torch.float32), b)
++
++
++class _HeadLayer(nn.Module):
++
++    def __init__(self, hidden: int, mlp_hidden: int, eps: float) -> None:
++        super().__init__()
++        self.attn_norm = _RMSNorm(hidden, eps)
++        self.attn = nn.Module()
++        self.attn.in_proj = _Linear(hidden, 3 * hidden)
++        self.attn.out_proj = _Linear(hidden, hidden)
++        self.mlp_norm = _RMSNorm(hidden, eps)
++        self.mlp = nn.Module()
++        self.mlp.up_proj = _Linear(hidden, mlp_hidden)
++        self.mlp.down_proj = _Linear(mlp_hidden, hidden)
++
++
++class LiLiCorrHead(nn.Module):
++    """Checkpoint keys live under ``lilicorr.*`` (loaded with prefix ``lilicorr``)."""
++
++    def __init__(self, hidden_size: int, lili_hidden: int, top_k: int, num_heads: int, num_layers: int,
++                 factor_dim: int, block_size: int, mlp_ratio: float, vector_eps: float, logit_scale: float,
++                 rms_eps: float = 1e-6, ckpt_block_size: int = None) -> None:
++        super().__init__()
++        # block_size = runtime proposal block this head instance serves (slots = block_size - 1);
++        # ckpt_block_size = block the checkpoint tables were trained with (sizes slot/bias tables).
++        self.top_k, self.heads, self.block = top_k, num_heads, block_size
++        self.ckpt_block = int(ckpt_block_size or block_size)
++        assert 2 <= block_size <= self.ckpt_block, "head block must be in [2, checkpoint block]"
++        self.slots = block_size - 1
++        ckpt_slots = self.ckpt_block - 1
++        self.hidden = lili_hidden
++        self.head_dim = lili_hidden // num_heads
++        self.vector_eps, self.logit_scale = vector_eps, logit_scale
++        mlp_hidden = int(lili_hidden * mlp_ratio)
++        self.token_proj = _Linear(hidden_size, lili_hidden)
++        self.context_proj = _Linear(hidden_size, lili_hidden)
++        self.pass_hidden_proj = _Linear(hidden_size, lili_hidden)
++        self.feature_norm = nn.Module()
++        self.feature_norm.weight = nn.Parameter(torch.ones(5, dtype=torch.float16), requires_grad=False)
++        self.feature_norm.bias = nn.Parameter(torch.zeros(5, dtype=torch.float16), requires_grad=False)
++        self.feature_mlp = nn.Module()
++        self.feature_mlp.up_proj = _Linear(5, lili_hidden)
++        self.feature_mlp.down_proj = _Linear(lili_hidden, lili_hidden)
++        # checkpoint shapes: slot_embedding [1,1,slots,1,H], rank_embedding [1,1,1,k,H]
++        self.slot_embedding = nn.Parameter(torch.zeros(1, 1, ckpt_slots, 1, lili_hidden, dtype=torch.float16),
++                                           requires_grad=False)
++        self.rank_embedding = nn.Parameter(torch.zeros(1, 1, 1, top_k, lili_hidden, dtype=torch.float16),
++                                           requires_grad=False)
++        self.relative_slot_bias = nn.Parameter(torch.zeros(num_heads, 2 * self.ckpt_block - 1, dtype=torch.float16),
++                                               requires_grad=False)
++        self.same_slot_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float16), requires_grad=False)
++        self.layers = nn.ModuleList([_HeadLayer(lili_hidden, mlp_hidden, rms_eps) for _ in range(num_layers)])
++        self.output_norm = _RMSNorm(lili_hidden, rms_eps)
++        self.anchor_norm = _RMSNorm(lili_hidden, rms_eps)
++        self.factor_input_proj = _Linear(3 * lili_hidden, lili_hidden)
++        self.in_head = _Linear(lili_hidden, factor_dim)
++        self.out_head = _Linear(lili_hidden, factor_dim)
++        self.anchor_out_head = _Linear(lili_hidden, factor_dim)
++
++    # -- helpers ---------------------------------------------------------------------------------------------
++    def attention_bias(self) -> torch.Tensor:
++        """[heads, nodes, nodes]: relative_slot_bias[h, q_slot - k_slot + block - 1] (+ same_slot_bias on the diagonal slot)."""
++        k = self.top_k
++        slot_of_node = torch.arange(self.slots * k, device=self.relative_slot_bias.device) // k
++        diff = slot_of_node[:, None] - slot_of_node[None, :] + (self.ckpt_block - 1)  # [nodes, nodes]
++        rel = self.relative_slot_bias.to(torch.float32)[:, diff]  # [heads, nodes, nodes]
++        same = (slot_of_node[:, None] == slot_of_node[None, :]).to(torch.float32)
++        return rel + self.same_slot_bias.to(torch.float32)[:, None, None] * same[None]
++
++    def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
++        return x / torch.sqrt((x * x).sum(-1, keepdim=True) + self.vector_eps)
++
++    # -- forward ---------------------------------------------------------------------------------------------
++    def forward(self, logits: torch.Tensor, draft_hidden: torch.Tensor, anchor_g: torch.Tensor,
++                embed_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        """logits [B, block, V] fp32; draft_hidden [B, block, H] (final-norm output); anchor_g [B, H];
++        embed_table [V, H] fp16.  Returns candidates [B, slots, k] int32, scores [B, slots, k, k] fp32."""
++        B = logits.shape[0]
++        k, slots = self.top_k, self.slots
++        slot_logits = logits[:, 1:, :].to(torch.float32)  # [B, slots, V]
++        cand_logits, candidates = torch.topk(slot_logits, k, dim=-1)  # sorted descending
++        if os.environ.get("LILICORR_HEAD_PROBS", "lse") == "softmax":
++            probs = torch.softmax(slot_logits, dim=-1).gather(-1, candidates)  # [B, slots, k]
++            lp = torch.log(probs)
++            relative = lp - lp[..., :1]
++        else:
++            # log p directly from the top-k values: lp = logit - logsumexp(all logits); no softmax-over-V,
++            # no GatherElements, no Slice (top-1 is the row max since topk is sorted).
++            lse = torch.logsumexp(slot_logits, dim=-1, keepdim=True)  # [B, slots, 1]
++            lp = cand_logits - lse
++            probs = torch.exp(lp)
++            relative = lp - torch.amax(lp, dim=-1, keepdim=True)
++        # Feature block without CumSum / Expand / Where / Concat: TensorRT's Myelin backend faulted (illegal
++        # address) on the Expand-from-runtime-Shape + Where pattern, so the 5 features stay separate tensors
++        # and the LayerNorm + first MLP layer are expanded per feature with broadcast arithmetic.
++        rank_const = (torch.arange(k, device=lp.device, dtype=torch.float32) / float(k - 1 if k > 1 else 1))
++        first_const = (torch.arange(k, device=lp.device) == 0).to(torch.float32)
++        zero_b = lp * 0.0
++        feats = [lp, probs.to(torch.float32), relative, zero_b + rank_const, zero_b + first_const]  # 5 x [B,slots,k]
++        mu = (feats[0] + feats[1] + feats[2] + feats[3] + feats[4]) * 0.2
++        devs = [f - mu for f in feats]
++        var = (devs[0] * devs[0] + devs[1] * devs[1] + devs[2] * devs[2] + devs[3] * devs[3] + devs[4] * devs[4]) * 0.2
++        inv = torch.rsqrt(var + 1e-5)
++        ln_w = self.feature_norm.weight.to(torch.float32)
++        ln_b = self.feature_norm.bias.to(torch.float32)
++        w_up = self.feature_mlp.up_proj.weight.to(torch.float32)  # [H, 5]
++        up = self.feature_mlp.up_proj.bias.to(torch.float32)  # [H]
++        for i in range(5):
++            n_i = (devs[i] * inv) * ln_w[i] + ln_b[i]  # normalised feature i, [B,slots,k]
++            up = up + n_i.unsqueeze(-1) * w_up[:, i]  # broadcast outer product -> [B,slots,k,H]
++        feature_states = self.feature_mlp.down_proj(F.silu(up))
++
++        # int32 indices + index_select (plain ONNX Gather): TensorRT handles these natively; the int64
++        # GatherND emitted for advanced indexing is what we suspect behind an illegal-address fault.
++        dbg = os.environ.get("LILICORR_HEAD_DEBUG", "")
++        cand32 = candidates.to(torch.int32)
++        embeds = embed_table.index_select(0, cand32.reshape(-1)).reshape(B, slots, k, -1).to(torch.float32)
++        if dbg == "zero_embed":
++            embeds = torch.zeros_like(embeds)
++        token_states = self.token_proj(embeds)
++        pass_states = self.pass_hidden_proj(draft_hidden[:, 1:, :].to(torch.float32))[:, :, None, :]
++        pos = (self.slot_embedding.to(torch.float32)[0, 0, :slots]
++               + self.rank_embedding.to(torch.float32)[0, 0])  # [slots,k,H] (first `slots` checkpoint slots)
++        x = token_states + pass_states + feature_states + pos[None]  # [B, slots, k, H]
++        x = x.reshape(B, slots * k, self.hidden)
++        if dbg == "zero_anchor":
++            anchor_g = torch.zeros_like(anchor_g)
++        anchor_state = self.context_proj(anchor_g.to(torch.float32))  # [B, H]
++
++        bias = self.attention_bias()[None]  # [1, heads, nodes, nodes]
++        scale = 1.0 / (self.head_dim ** 0.5)
++        for layer in self.layers:
++            h = layer.attn_norm(x)
++            qkv = layer.attn.in_proj(h)
++            q, kk, v = qkv.split(self.hidden, dim=-1)
++            q = q.reshape(B, -1, self.heads, self.head_dim).transpose(1, 2)
++            kk = kk.reshape(B, -1, self.heads, self.head_dim).transpose(1, 2)
++            v = v.reshape(B, -1, self.heads, self.head_dim).transpose(1, 2)
++            att = torch.softmax(torch.matmul(q, kk.transpose(-1, -2)) * scale + bias, dim=-1)
++            o = torch.matmul(att, v).transpose(1, 2).reshape(B, -1, self.hidden)
++            x = x + layer.attn.out_proj(o)
++            x = x + layer.mlp.down_proj(F.silu(layer.mlp.up_proj(layer.mlp_norm(x))))
++
++        x = self.output_norm(x)  # [B, nodes, H]
++        anchor_state = self.anchor_norm(anchor_state)  # [B, H]
++        # factor_input_proj([x, a, x*a]) == Wx.x + Wa.a + Wxa.(x*a) + b  (no Concat / Expand)
++        anchor_rep = anchor_state[:, None, :] + x * 0.0  # broadcast to [B, nodes, H]
++        w_f = self.factor_input_proj.weight.to(torch.float32)  # [H, 3H]
++        h3 = self.hidden
++        factors = (F.linear(x, w_f[:, :h3]) + F.linear(anchor_rep, w_f[:, h3:2 * h3])
++                   + F.linear(x * anchor_rep, w_f[:, 2 * h3:]) + self.factor_input_proj.bias.to(torch.float32))
++        factors = F.silu(factors)
++        out_v = self._l2norm(self.out_head(factors)).reshape(B, slots, k, -1)
++        in_v = self._l2norm(self.in_head(factors)).reshape(B, slots, k, -1)
++        anchor_out = self._l2norm(self.anchor_out_head(anchor_state))  # [B, F]
++
++        first_score = torch.einsum("bkf,bf->bk", in_v[:, 0], anchor_out) * self.logit_scale  # [B, k]
++        ones_k1 = torch.ones(k, 1, dtype=torch.float32, device=logits.device)
++        first_block = first_score[:, None, :] * ones_k1  # [B, k, k]: every predecessor row -> same scores
++        if slots > 1:
++            # scores[b, s, p, c] = out[s-1, p] . in[s, c]
++            rest = torch.einsum("bspf,bscf->bspc", out_v[:, :-1], in_v[:, 1:]) * self.logit_scale
++            scores = torch.cat([first_block[:, None], rest], dim=1)
++        else:
++            scores = first_block[:, None]
++        return cand32, scores
+diff --git a/tensorrt_edgellm/models/lilicorr/modeling_lilicorr_draft.py b/tensorrt_edgellm/models/lilicorr/modeling_lilicorr_draft.py
+new file mode 100644
+index 0000000..8a9caec
+--- /dev/null
++++ b/tensorrt_edgellm/models/lilicorr/modeling_lilicorr_draft.py
+@@ -0,0 +1,292 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LiLiCorr draft (nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) on the DFlash V1 runtime contract.
++
++The LiLiCorr drafter is a DFlash-style parallel block drafter:
++
++* 5 decoder layers in the DFlash2 shape (grouped dynamic conv around attention and MLP),
++* sliding-window attention (1024) with a learned per-head attention sink and q/k norms,
++* ``fc`` consumes the hidden states of **six** target layers,
++* an extra "LiLiCorr" correlation head that re-ranks the per-slot top-k candidates.
++
++This module runs the drafter without the correlation head (plain per-slot top-1 proposals), which is
++exactly the DFlash V1 runtime path: logits out, block_size from the checkpoint, any number of target
++layers. The correlation head is a later runtime stage.
++"""
++import os
++from typing import List, Tuple
++
++import torch
++import torch.nn as nn
++
++from ...config import ModelConfig
++from ..dflash.modeling_dflash_draft import (DFlashCachedDecoderLayer,
++                                            DFlashDraftModel)
++from ..dflash2.modeling_dflash2_draft import DFlash2DecoderLayer
++from ..dspark.modeling_dspark_draft import DSparkCachedAttention
++from ..ops import dflash2_grouped_dynamic_conv
++from .lilicorr_head import LiLiCorrHead
++
++
++class LiLiCorrDecoderLayer(DFlash2DecoderLayer):
++    """DFlash2 conv layer whose attention adds sliding window + learned sink.
++
++    LiLiCorr weights are ~10x larger than usual (std ~0.25), so the MLP/attention branch
++    outputs exceed FP16 range. The converter folds power-of-two scales into up/down/o_proj;
++    this layer runs the (linear) output conv on the scaled values and multiplies back in FP32.
++    """
++
++    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
++        super().__init__(config, layer_idx)
++        self.self_attn = DSparkCachedAttention(config, layer_idx)
++        fold = getattr(config, "lilicorr_scale_fold", None) or {}
++        self.mlp_unfold = float(fold.get("mlp", 1.0))
++        self.attn_unfold = float(fold.get("attn", 1.0))
++
++    def _conv_out(self, conv, hidden, coefficients, residual, unfold):
++        """conv.finish without the fused residual: conv(fp16 scaled) -> fp32 * unfold + residual."""
++        out = dflash2_grouped_dynamic_conv(hidden, coefficients, conv.base_kernel[1], None,
++                                           block_size=conv.block_size, kernel_size=conv.kernel_size,
++                                           group_size=conv.group_size, fuse_residual=0)
++        return residual + out.to(torch.float32) * unfold
++
++    def forward_ragged(self, hidden_states, h_delta, past_key_value,
++                       rope_cos_sin, **metadata):
++        batch = metadata["query_lengths"].shape[0]
++        block = hidden_states.shape[0] // batch
++        hidden_size = self.self_attn.hidden_size
++        residual = hidden_states.to(torch.float32).reshape(batch, block, hidden_size)
++        attention_input = self.input_layernorm(residual).to(torch.float16)
++        attention_input, attention_post = self.attention_conv.prepare(attention_input)
++        attention, present_kv = self.self_attn.forward_ragged(
++            attention_input.reshape(-1, hidden_size), h_delta, past_key_value,
++            rope_cos_sin, **metadata)
++        hidden_states = self._conv_out(self.attention_conv,
++                                       attention.reshape(batch, block, hidden_size),
++                                       attention_post, residual, self.attn_unfold)
++        residual = hidden_states
++        mlp_input = self.post_attention_layernorm(residual).to(torch.float16)
++        mlp_input, mlp_post = self.mlp_conv.prepare(mlp_input)
++        feed_forward = self.mlp(mlp_input)
++        hidden_states = self._conv_out(self.mlp_conv, feed_forward, mlp_post, residual,
++                                       self.mlp_unfold)
++        return hidden_states.reshape(-1, hidden_size), present_kv
++
++
++class LiLiCorrPlainDecoderLayer(DFlashCachedDecoderLayer):
++    """Debug variant: no grouped conv, SWA/sink attention only."""
++
++    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
++        super().__init__(config, layer_idx)
++        self.self_attn = DSparkCachedAttention(config, layer_idx)
++
++
++class LiLiCorrDraftModel(DFlashDraftModel):
++    """DFlash V1 contract (logits output) with LiLiCorr layers.
++
++    The residual stream runs in FP32 inside the DFlash2 layers; the final norm output is cast back to
++    FP16 before the (NVFP4 / FP16) lm_head.
++    """
++    # The exporter constant-folds the tiny fp32-cast head weights (e.g. feature_mlp.up_proj [5,1024]) into
++    # anonymous fp16 initializers; this opt-in restores them to FP32 when the MatMul's other input is FP32.
++    match_fp32_matmul_initializers = True
++
++    def post_export_onnx_fixup(self, onnx_path: str) -> None:
++        """Called by the exporter after its generic dtype fixup (see onnx_dtype_fixup.py)."""
++        from .onnx_dtype_fixup import fix_mixed_dtype_binary_ops
++        fix_mixed_dtype_binary_ops(onnx_path)
++
++    def __init__(self, config: ModelConfig) -> None:
++        super().__init__(config)
++        # Export-time numeric bisection: embed_only | fc_only | (unset = full model)
++        self.debug_mode = os.environ.get("LILICORR_DEBUG_MODE", "")
++        layer_cls = (LiLiCorrPlainDecoderLayer
++                     if getattr(config, "lilicorr_no_conv", False) else
++                     LiLiCorrDecoderLayer)
++        self.layers = nn.ModuleList([
++            layer_cls(config, layer_idx=i)
++            for i in range(config.num_hidden_layers)
++        ])
++        # Optional LiLiCorr correlation head (per-slot top-k re-ranking lattice). Weights live under
++        # ``lilicorr.*``; the token embedding table is copied from the base checkpoint at load time.
++        head_cfg = getattr(config, "lilicorr_head", None) or {}
++        self.lilicorr = None
++        if head_cfg:
++            # The head is specialised for the runtime proposal block (rows per sequence); the checkpoint
++            # block (8) only sizes the slot embedding / slot-distance bias tables.
++            head_block = int(os.environ.get("EDGELLM_LILICORR_BLOCK", config.dflash_block_size))
++            self.lilicorr = LiLiCorrHead(
++                config.hidden_size, int(head_cfg["lilicorr_hidden_size"]),
++                int(head_cfg["lilicorr_candidate_topk"]), int(head_cfg["lilicorr_num_heads"]),
++                int(head_cfg["lilicorr_num_layers"]), int(head_cfg["lilicorr_factor_dim"]),
++                head_block, float(head_cfg.get("lilicorr_mlp_ratio", 2.0)),
++                float(head_cfg.get("lilicorr_vector_eps", 1e-4)),
++                float(head_cfg.get("lilicorr_logit_scale", 8.0)), float(config.rms_norm_eps),
++                ckpt_block_size=int(config.dflash_block_size))
++            self.lilicorr_embed_table = nn.Parameter(
++                torch.zeros(config.vocab_size, config.hidden_size, dtype=torch.float16),
++                requires_grad=False)
++
++    def _h_delta(self, target_hidden_concat: torch.Tensor,
++                 dtype: torch.dtype) -> torch.Tensor:
++        if self.fc_native_precision:
++            h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
++        else:
++            bias = (self.fc.bias.to(torch.float32)
++                    if self.fc.bias is not None else None)
++            h_delta_acc = torch.nn.functional.linear(
++                target_hidden_concat.to(torch.float32),
++                self.fc.weight.to(torch.float32), bias)
++        return self.hidden_norm(h_delta_acc).to(dtype)
++
++    def _logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self._logits_and_hidden(hidden_states)[0]
++
++    def _logits_and_hidden(self, hidden_states: torch.Tensor):
++        normed = self.norm(hidden_states.to(torch.float32)).to(torch.float16)
++        logits = self.lm_head(normed).to(torch.float32)
++        cap = getattr(self.config, "final_logit_softcapping", None)
++        if cap is not None:
++            logits = torch.tanh(logits / cap) * cap
++        return logits, normed
++
++    def _head_outputs(self, logits, normed, h_delta, metadata):
++        """LiLiCorr lattice: candidates [B, slots, k] int32, scores [B, slots, k, k] fp32."""
++        # Static block (checkpoint block_size): the proposal always has exactly `block` rows per sequence,
++        # so batch follows from the row count without touching the (independently profiled) query_lengths.
++        block = int(self.lilicorr.block)  # runtime proposal block the head was exported for
++        rows = logits.shape[0]
++        batch = rows // block
++        # Split rows into [batch, block] with a gather instead of a reshape: torch.export cannot prove the
++        # symbolic row count divisible by a non-power-of-two block, but index_select needs no such proof.
++        row_sel = ((torch.arange(batch, device=logits.device, dtype=torch.int32) * block)[:, None]
++                   + torch.arange(block, device=logits.device, dtype=torch.int32)[None, :]).reshape(-1)
++        logits_b = logits.index_select(0, row_sel).reshape(batch, block, -1)
++        normed_b = normed.index_select(0, row_sel).reshape(batch, block, -1)
++        tok2seq = metadata["delta_token_to_sequence"].to(torch.int32)
++        seq_ids = torch.arange(batch, device=tok2seq.device, dtype=torch.int32)
++        # Last delta row of each sequence = max row index carrying that sequence id (no CumSum: TensorRT's
++        # CumSum lowering trips the Myelin optimizer with an empty-tensor plugin producer).
++        row_ids = torch.arange(h_delta.shape[0], device=tok2seq.device, dtype=torch.int32)
++        member = (tok2seq[None, :] == seq_ids[:, None]).to(torch.int32)  # [batch, delta_rows]
++        last_idx = (member * row_ids[None, :]).max(dim=1).values
++        anchor_g = h_delta.index_select(0, last_idx)  # fused target hidden of each sequence's anchor token
++        return self.lilicorr(logits_b, normed_b, anchor_g, self.lilicorr_embed_table)
++
++    def forward(
++        self,
++        inputs_embeds: torch.Tensor,
++        target_hidden_concat: torch.Tensor,
++        rope_rotary_cos_sin: torch.Tensor,
++        context_lengths: torch.Tensor,
++        kvcache_start_index: torch.Tensor,
++        kv_page_table: torch.Tensor,
++        delta_lengths: torch.Tensor,
++        attention_mask: torch.Tensor,
++        attention_pos_id: torch.Tensor,
++        past_key_values: List[torch.Tensor],
++    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
++        h_delta = self._h_delta(target_hidden_concat, inputs_embeds.dtype)
++        hidden_states = (inputs_embeds.to(h_delta.dtype) if getattr(
++            self.config, "lilicorr_no_conv", False) else
++                         inputs_embeds.to(torch.float32))
++        present_key_values = []
++        for i, layer in enumerate(self.layers):
++            hidden_states, present_kv = layer(
++                hidden_states, h_delta, past_key_values[i],
++                rope_rotary_cos_sin, kvcache_start_index, kv_page_table,
++                delta_lengths, context_lengths, attention_mask,
++                attention_pos_id)
++            present_key_values.append(present_kv)
++        return self._logits(hidden_states), present_key_values
++
++    def forward_ragged(self, inputs_embeds: torch.Tensor,
++                       target_hidden_concat: torch.Tensor,
++                       past_key_values: Tuple[torch.Tensor, ...], **metadata):
++        if self.debug_mode == "embed_only":
++            probe = target_hidden_concat[:1, :inputs_embeds.shape[-1]].to(torch.float32) * 0.0
++            hidden = inputs_embeds.to(torch.float32) + probe
++            return self._logits(hidden), tuple(past_key_values)
++        if self.debug_mode == "fc_only":
++            h_delta = self._h_delta(target_hidden_concat, inputs_embeds.dtype)
++            hidden = inputs_embeds.to(torch.float32) + h_delta.to(torch.float32).mean(0, keepdim=True)
++            return self._logits(hidden), tuple(past_key_values)
++        h_delta = self._h_delta(target_hidden_concat, inputs_embeds.dtype)
++        if self.debug_mode in ("attn_only", "mlp_only"):
++            hidden = inputs_embeds.to(h_delta.dtype)
++            present = []
++            for layer_idx, layer in enumerate(self.layers):
++                if self.debug_mode == "attn_only":
++                    attn, present_kv = layer.self_attn.forward_ragged(
++                        layer.input_layernorm(hidden), h_delta,
++                        past_key_values[layer_idx],
++                        metadata["rope_rotary_cos_sin"], **metadata)
++                    hidden = hidden + attn
++                else:
++                    present_kv = past_key_values[layer_idx]
++                    hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
++                present.append(present_kv)
++            return self._logits(hidden), tuple(present)
++        hidden_states = (inputs_embeds.to(h_delta.dtype) if getattr(
++            self.config, "lilicorr_no_conv", False) else
++                         inputs_embeds.to(torch.float32))
++        present = []
++        for layer_idx, layer in enumerate(self.layers):
++            hidden_states, present_kv = layer.forward_ragged(
++                hidden_states, h_delta, past_key_values[layer_idx],
++                metadata["rope_rotary_cos_sin"], **metadata)
++            present.append(present_kv)
++        logits, normed = self._logits_and_hidden(hidden_states)
++        if self.lilicorr is not None:
++            cand, scores = self._head_outputs(logits, normed, h_delta, metadata)
++            return logits, tuple(present), (cand, scores)
++        return logits, tuple(present)
++
++    def onnx_export_spec(self):
++        spec = super().onnx_export_spec()
++        if self.lilicorr is None:
++            return spec
++        from ..default.modeling_default import OnnxSpec
++        return OnnxSpec(_make_lilicorr_wrapper(self, self.config.num_hidden_layers), spec.args,
++                        spec.input_names, list(spec.output_names) + ["lilicorr_candidates", "lilicorr_scores"],
++                        spec.dynamic_shapes)
++
++
++def _make_lilicorr_wrapper(model: nn.Module, num_layers: int) -> nn.Module:
++    """DFlash ragged wrapper that also returns the LiLiCorr lattice outputs."""
++    names = (["inputs_embeds", "dflash_target_hidden_concat"] +
++             [f"past_key_values_{i}" for i in range(num_layers)] + [
++                 "rope_rotary_cos_sin", "positions", "query_start_offsets",
++                 "query_lengths", "past_lengths", "attention_sequence_lengths",
++                 "state_indices", "execution_phase_marker",
++                 "context_sequence_count_carrier", "kv_page_table",
++                 "dflash_delta_rope_cos_sin", "dflash_delta_positions",
++                 "dflash_delta_token_to_sequence", "attention_position_ids",
++                 "packed_attention_mask"
++             ])
++    past_kv = "({},)".format(", ".join(f"past_key_values_{i}" for i in range(num_layers)))
++    body = (
++        f"    logits, present, extras = self._model.forward_ragged(\n"
++        f"        inputs_embeds, dflash_target_hidden_concat, {past_kv},\n"
++        f"        rope_rotary_cos_sin=rope_rotary_cos_sin, positions=positions,\n"
++        f"        query_start_offsets=query_start_offsets, query_lengths=query_lengths,\n"
++        f"        past_lengths=past_lengths,\n"
++        f"        attention_sequence_lengths=attention_sequence_lengths,\n"
++        f"        state_indices=state_indices, execution_phase_marker=execution_phase_marker,\n"
++        f"        context_sequence_count_carrier=context_sequence_count_carrier,\n"
++        f"        kv_page_table=kv_page_table, delta_rope_cos_sin=dflash_delta_rope_cos_sin,\n"
++        f"        delta_positions=dflash_delta_positions,\n"
++        f"        delta_token_to_sequence=dflash_delta_token_to_sequence,\n"
++        f"        attention_position_ids=attention_position_ids,\n"
++        f"        packed_attention_mask=packed_attention_mask)\n"
++        f"    return (logits,) + tuple(present) + tuple(extras)\n")
++    globs: dict = {}
++    exec("def _forward(self, {}):\n{}".format(", ".join(names), body), globs)  # noqa: S102
++
++    class _Wrapper(nn.Module):
++
++        def __init__(self, wrapped_model: nn.Module) -> None:
++            super().__init__()
++            self._model = wrapped_model
++
++    _Wrapper.forward = globs["_forward"]
++    return _Wrapper(model)
+diff --git a/tensorrt_edgellm/models/lilicorr/onnx_dtype_fixup.py b/tensorrt_edgellm/models/lilicorr/onnx_dtype_fixup.py
+new file mode 100644
+index 0000000..48d4fbb
+--- /dev/null
++++ b/tensorrt_edgellm/models/lilicorr/onnx_dtype_fixup.py
+@@ -0,0 +1,109 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Post-export pass: make every binary op in the exported draft graph dtype-consistent.
++
++The dynamo exporter constant-folds the LiLiCorr head's ``param.to(float32)`` casts into fp32 initializers
++and the generic Edge-LLM fixup then downcasts those to fp16.  The generic fixup only restores an
++initializer that is a *direct* input of the mismatched op; here the folded constant may reach the op
++through Unsqueeze/Reshape/... (e.g. the slot+rank position embedding).  This pass resolves such chains
++back to the initializer and promotes it to fp32; when the fp16 side is a real activation it inserts a
++Cast instead.  The head computes in fp32, so widening is always numerically safe.
++"""
++import logging
++import os
++
++import numpy as np
++import onnx
++from onnx import numpy_helper
++
++logger = logging.getLogger(__name__)
++
++_BINARY = frozenset({"Add", "Sub", "Mul", "Div", "MatMul", "Gemm", "Concat", "Pow", "Max", "Min", "Where"})
++_PASS_THROUGH = frozenset({"Unsqueeze", "Squeeze", "Reshape", "Transpose", "Expand", "Identity", "Flatten"})
++FP32, FP16 = onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16
++
++
++def fix_mixed_dtype_binary_ops(onnx_path: str) -> int:
++    model = onnx.load(onnx_path)  # full load: initializers are re-saved below
++    g = model.graph
++    init = {t.name: t for t in g.initializer}
++    vi = {v.name: v for v in list(g.value_info) + list(g.input) + list(g.output)}
++    prod = {o: n for n in g.node for o in n.output}
++
++    def resolve_init(name, chain):
++        """Follow single-data-input shape ops back to an initializer; returns initializer name or None."""
++        while True:
++            if name in init:
++                return name
++            n = prod.get(name)
++            if n is None or n.op_type not in _PASS_THROUGH:
++                return None
++            chain.append(n)
++            name = n.input[0]
++
++    def dtype_of(name):
++        # value_info is stale for tensors derived from initializers the generic fixup downcast:
++        # resolve shape-op chains back to the initializer first.
++        src = resolve_init(name, [])
++        if src is not None:
++            return init[src].data_type
++        v = vi.get(name)
++        return v.type.tensor_type.elem_type if v is not None and v.type.tensor_type.HasField("elem_type") else 0
++
++    n_promoted = n_cast = 0
++    changed = True
++    rounds = 0
++    while changed and rounds < 6:
++        changed = False
++        rounds += 1
++        for node in list(g.node):
++            if node.op_type not in _BINARY or len(node.input) < 2:
++                continue
++            first_data = 1 if node.op_type == "Where" else 0  # Where[0] is the bool condition
++            dts = {dtype_of(i) for i in node.input[first_data:]}
++            if not (FP32 in dts and FP16 in dts):
++                continue
++            for idx, name in enumerate(node.input):
++                if idx < first_data or dtype_of(name) != FP16:
++                    continue
++                chain = []
++                src = resolve_init(name, chain)
++                if src is not None:
++                    t = init[src]
++                    data = numpy_helper.to_array(t).astype(np.float32)
++                    t.CopyFrom(numpy_helper.from_array(data, name=src))
++                    for inter in chain:  # refresh stale value_info along the chain
++                        if inter.output[0] in vi:
++                            vi[inter.output[0]].type.tensor_type.elem_type = FP32
++                    if src in vi:
++                        vi[src].type.tensor_type.elem_type = FP32
++                    n_promoted += 1
++                    logger.info("lilicorr dtype fixup: promoted initializer %s %s to FP32 (feeds %s %s)", src,
++                                list(t.dims), node.op_type, node.output[0])
++                else:
++                    new_name = f"{name}_f32_{n_cast}"
++                    cast = onnx.helper.make_node("Cast", [name], [new_name], to=FP32,
++                                                 name=f"lilicorr_cast_{n_cast}")
++                    pos = list(g.node).index(node)
++                    g.node.insert(pos, cast)
++                    node.input[idx] = new_name
++                    v = g.value_info.add()
++                    v.name = new_name
++                    v.type.tensor_type.elem_type = FP32
++                    vi[new_name] = v
++                    prod[new_name] = cast
++                    n_cast += 1
++                    logger.info("lilicorr dtype fixup: cast %s to FP32 before %s %s", name, node.op_type,
++                                node.output[0])
++                changed = True
++    total = n_promoted + n_cast
++    if total == 0:
++        return 0
++    data_file = os.path.basename(onnx_path) + ".data"
++    ext_path = os.path.join(os.path.dirname(onnx_path), data_file)
++    if os.path.isfile(ext_path):
++        os.remove(ext_path)
++    onnx.save_model(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
++                    location=data_file, convert_attribute=True)
++    logger.info("lilicorr dtype fixup: %d initializers promoted, %d casts inserted (%d rounds)", n_promoted,
++                n_cast, rounds)
++    return total
+diff --git a/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py b/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py
+index 441504b..d22e381 100644
+--- a/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py
++++ b/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py
+@@ -51,6 +51,8 @@ Token-major export conventions
+     -> present_ssm_states  tuple of updated SSM states per mamba-layer
+ """
+ 
++import copy
++import os
+ import itertools
+ from typing import List, Optional, Tuple
+ 
+@@ -62,13 +64,13 @@ from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
+                        QUANT_NVFP4_A16, MambaConfig, ModelConfig)
+ from ..default.modeling_default import (OnnxSpec,
+                                         _concat_hidden_in_provider_order)
+-from ..linear import FP16Linear, make_linear
++from ..linear import FP16Linear, is_int4_linear, is_nvfp4_a16_linear, make_linear
+ from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
+                    causal_conv1d_with_intermediate,
+                    nvfp4_a16_blackwell_moe_plugin, nvfp4_a16_moe_plugin,
+                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                    update_ssm_state, update_ssm_state_with_intermediate,
+-                   use_blackwell_nvfp4_a16_moe, use_geforce_nvfp4_moe)
++                   use_blackwell_nvfp4_a16_moe, use_geforce_nvfp4_moe, qkv_concat)
+ 
+ _NVFP4_ACTIVATION_RELU2 = 4
+ _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK = 1
+@@ -585,6 +587,23 @@ class NemotronHTopkRouter(nn.Module):
+ # ---------------------------------------------------------------------------
+ 
+ 
++# DFlash target hidden convention. Edge-LLM captures the OUTPUT of target layer i; vLLM/llama.cpp
++# (and drafters trained on HF ``output_hidden_states``) use the INPUT of layer i. Set
++# EDGELLM_DFLASH_TARGET_INPUTS=1 for drafters such as Nemotron 3.5 Bolt's LiLiCorr.
++_DFLASH_TARGET_INPUTS = os.environ.get("EDGELLM_DFLASH_TARGET_INPUTS", "0") == "1"
++
++
++def _moe_layer_config(config: ModelConfig, layer_idx: int) -> ModelConfig:
++    """Config view with this layer's MoE sizes (heterogeneous Puzzle stacks)."""
++    override = (getattr(config, "moe_layer_configs", None) or {}).get(layer_idx)
++    if not override:
++        return config
++    cfg = copy.copy(config)
++    for key, value in override.items():
++        setattr(cfg, key, value)
++    return cfg
++
++
+ class NemotronHMoEMLP(nn.Module):
+     """Mixture-of-Experts MLP for NemotronH using the configured NVFP4 MoE plugin.
+ 
+@@ -1006,6 +1025,8 @@ class NemotronHAttentionMixer(nn.Module):
+                                   num_attention_heads * head_dim,
+                                   hidden_size,
+                                   module_name=f"{module_prefix}.o_proj")
++        self._uses_int4_qkv = any(is_int4_linear(p) or is_nvfp4_a16_linear(p)
++                                  for p in (self.q_proj, self.k_proj, self.v_proj))
+ 
+     def forward(
+         self,
+@@ -1047,9 +1068,14 @@ class NemotronHAttentionMixer(nn.Module):
+         # value in the FX graph for the unified ONNX translation.
+         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
+                                        [1.0, 1.0, 1.0])
++        # NVFP4-A16 GEMM plugin outputs must not feed an exposed ONNX Concat: the resulting Myelin
++        # fusion corrupts the packed QKV in the built engine (same workaround as the DSpark draft).
++        if getattr(self, "_uses_int4_qkv", False):
++            qkv = qkv_concat(query_states, key_states, value_states)
++        else:
++            qkv = torch.cat([query_states, key_states, value_states], dim=-1)
+         attn_output, present_key_value = attention_plugin(
+-            torch.cat([query_states, key_states, value_states],
+-                      dim=-1), past_key_value, context_lengths,
++            qkv, past_key_value, context_lengths,
+             rope_rotary_cos_sin, kvcache_start_index, kv_page_table, **kwargs)
+ 
+         attn_output = attn_output.reshape(batch_size, seq_len,
+@@ -1136,7 +1162,8 @@ class NemotronHDecoderLayer(nn.Module):
+         elif layer_type == LAYER_MLP:
+             self.mixer = NemotronHMLP(config, module_prefix)
+         elif layer_type == LAYER_MOE:
+-            self.mixer = NemotronHMoEMLP(config, module_prefix)
++            self.mixer = NemotronHMoEMLP(_moe_layer_config(config, layer_idx),
++                                         module_prefix)
+         elif layer_type == LAYER_ATTN:
+             self.mixer = NemotronHAttentionMixer(config, layer_idx,
+                                                  module_prefix)
+@@ -1291,12 +1318,15 @@ class NemotronHBackbone(nn.Module):
+         replay_dt_states_list: List[torch.Tensor] = []
+         dflash_hidden_by_layer: dict[int, torch.Tensor] = {}
+         dflash_target_set = set(dflash_target_layer_ids or [])
++        _dflash_set_for_capture = dflash_target_set
+         last_layer_idx = len(self.layers) - 1
+         attn_idx = 0
+         mamba_idx = 0
+ 
+         for layer_idx, (layer,
+                         lt) in enumerate(zip(self.layers, self.layer_types)):
++            if _DFLASH_TARGET_INPUTS and layer_idx in _dflash_set_for_capture:
++                dflash_hidden_by_layer[layer_idx] = hidden_states
+             if lt == LAYER_MAMBA:
+                 if collect_intermediate_states:
+                     (hidden_states, conv_out, ssm_out, inter_conv, replay_da,
+@@ -1345,11 +1375,12 @@ class NemotronHBackbone(nn.Module):
+ 
+             # The final layer's DFlash aux feature is the post-norm_f hidden.
+             # Earlier target layers use the raw residual stream.
+-            if layer_idx in dflash_target_set and layer_idx != last_layer_idx:
++            if (not _DFLASH_TARGET_INPUTS and layer_idx in dflash_target_set
++                    and layer_idx != last_layer_idx):
+                 dflash_hidden_by_layer[layer_idx] = hidden_states
+ 
+         normed = self.norm_f(hidden_states)
+-        if last_layer_idx in dflash_target_set:
++        if not _DFLASH_TARGET_INPUTS and last_layer_idx in dflash_target_set:
+             dflash_hidden_by_layer[last_layer_idx] = normed
+         dflash_hidden_concat = _concat_hidden_in_provider_order(
+             dflash_hidden_by_layer, dflash_target_layer_ids)
+@@ -1400,6 +1431,7 @@ class NemotronHBackbone(nn.Module):
+         replay_dt_states = []
+         dflash_hidden_by_layer: dict[int, torch.Tensor] = {}
+         dflash_targets = set(dflash_target_layer_ids or [])
++        _dflash_set_for_capture = dflash_targets
+         last_layer_idx = len(self.layers) - 1
+         attn_idx = 0
+         mamba_idx = 0
+@@ -1423,6 +1455,8 @@ class NemotronHBackbone(nn.Module):
+         )
+         for layer_idx, (layer, layer_type) in enumerate(
+                 zip(self.layers, self.layer_types)):
++            if _DFLASH_TARGET_INPUTS and layer_idx in _dflash_set_for_capture:
++                dflash_hidden_by_layer[layer_idx] = hidden_states
+             if layer_type == LAYER_MAMBA:
+                 outputs = layer.forward_ragged(
+                     hidden_states,
+@@ -1448,10 +1482,11 @@ class NemotronHBackbone(nn.Module):
+                     **common)
+                 present_key_values.append(present_kv)
+                 attn_idx += 1
+-            if layer_idx in dflash_targets and layer_idx != last_layer_idx:
++            if (not _DFLASH_TARGET_INPUTS and layer_idx in dflash_targets
++                    and layer_idx != last_layer_idx):
+                 dflash_hidden_by_layer[layer_idx] = hidden_states
+         normed = self.norm_f(hidden_states)
+-        if last_layer_idx in dflash_targets:
++        if not _DFLASH_TARGET_INPUTS and last_layer_idx in dflash_targets:
+             dflash_hidden_by_layer[last_layer_idx] = normed
+         dflash_hidden_concat = _concat_hidden_in_provider_order(
+             dflash_hidden_by_layer, dflash_target_layer_ids)
+diff --git a/tensorrt_edgellm/onnx/export.py b/tensorrt_edgellm/onnx/export.py
+index d29c698..a9c08b4 100644
+--- a/tensorrt_edgellm/onnx/export.py
++++ b/tensorrt_edgellm/onnx/export.py
+@@ -1178,6 +1178,10 @@ def _export_model(
+                                 getattr(model,
+                                         "match_fp32_elementwise_initializers",
+                                         False)))
++    # Model-specific post pass (e.g. LiLiCorr head: fp32 constants reaching binary ops via shape ops).
++    post_fixup = getattr(model, "post_export_onnx_fixup", None)
++    if post_fixup is not None:
++        post_fixup(output_path)
+     _strip_attention_plugin_optional_inputs(output_path)
+     # Must run after every pass that re-saves with save_as_external_data
+     # (which can re-materialize stray payloads on zero-volume tensors).
+diff --git a/tensorrt_edgellm/onnx/export_encoder.py b/tensorrt_edgellm/onnx/export_encoder.py
+index aa795dd..83f0d04 100644
+--- a/tensorrt_edgellm/onnx/export_encoder.py
++++ b/tensorrt_edgellm/onnx/export_encoder.py
+@@ -76,6 +76,7 @@ __all__ = [
+ _NEMOTRON_OMNI_MODEL_TYPES: frozenset[str] = frozenset([
+     "NemotronH_Nano_VL_V2",
+     "NemotronH_Nano_Omni_Reasoning_V3",
++    "NemotronH_Omni_Reasoning_V3",
+ ])
+ 
+ # Maps model_type → internal family name
+@@ -99,6 +100,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
+     "gemma4_unified": "gemma4_unified",
+     "NemotronH_Nano_VL_V2": "nemotron_omni",
+     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
++    "NemotronH_Omni_Reasoning_V3": "nemotron_omni",
+     # Cosmos3-Edge reasoner: SigLIP2 packed-patch ViT + Qwen3-VL-style
+     # PatchMerger, exported on the qwen3_vl visual ONNX I/O contract.
+     "cosmos3_edge": "cosmos3_reasoner",
+diff --git a/tensorrt_edgellm/scripts/export.py b/tensorrt_edgellm/scripts/export.py
+index 076ede7..3e69240 100644
+--- a/tensorrt_edgellm/scripts/export.py
++++ b/tensorrt_edgellm/scripts/export.py
+@@ -96,6 +96,7 @@ logger = logging.getLogger("tensorrt_edgellm.scripts.export")
+ _NEMOTRON_OMNI_MODEL_TYPES = frozenset([
+     "NemotronH_Nano_VL_V2",
+     "NemotronH_Nano_Omni_Reasoning_V3",
++    "NemotronH_Omni_Reasoning_V3",
+ ])
+ 
+ _GEMMA4_MODEL_TYPES = frozenset([

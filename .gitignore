@@ -1,0 +1,7 @@
+logs/
+*.log
+*.onnx
+*.onnx.data
+*.engine
+*.safetensors
+__pycache__/
