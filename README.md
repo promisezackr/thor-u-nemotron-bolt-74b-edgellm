@@ -40,7 +40,7 @@ Block 大小扫描（代码 512，单路）：
 | **6** | **4.38** | **57.4** | 7.7 | 68.6 |
 | 8 | 4.92 | 56.4 | 7.7 | 79.6 |
 
-### 2.2 OpenAI 兼容服务（`llm_server`，引擎 KV 32k）
+### 2.2 OpenAI 兼容服务（`llm_server`，引擎 KV 32k；128k 引擎同速）
 
 | 提示 | 输出 token | TTFT | 纯解码 t/s | 含 TTFT t/s |
 |---|---|---|---|---|
@@ -57,8 +57,10 @@ A16 MoE 插件限制单次 prefill ≤ 4096 token（引擎 maxInputLen 2048 × b
 | 7,464 | 2.8 s | 44.6 | 正确 |
 | 14,864 | 5.5 s | 47.2 | 正确 |
 | 29,664 | 10.9 s | 46.2 | 正确 |
+| 74,064（128k 引擎） | 28.6 s | 55.2 | 正确 |
+| 123,385（128k 引擎） | 50.6 s | 52.4 | 正确 |
 
-prefill 吞吐约 2.7k token/s（分块 2048）。
+prefill 吞吐约 2.4–2.7k token/s（分块 2048）。生产引擎 `bolt-spec-128k`：KV 131072（模型原生 262k 受显存限制未开），常驻后大页池剩约 1 GB。
 
 ### 2.4 成本结构（为什么单路停在 ~55）
 
@@ -74,7 +76,7 @@ prefill 吞吐约 2.7k token/s（分块 2048）。
   edgellm-src/        打补丁的 tensorrt_edgellm Python 包（导出用）
   pyenv/site-packages torch 2.13 aarch64 + tensorrt 10.13.3 Python 绑定（ubuntu2404/sbsa python3-libnvinfer）
   ext/external_nvfp4_moe_weights.safetensors   37.2 GB 外置专家权重（引擎目录用硬链接共享）
-  engines/bolt-spec-long/   spec_base.engine + spec_draft.engine + base_config/draft_config + embedding
+  engines/bolt-spec-128k/   spec_base.engine + spec_draft.engine + base_config/draft_config + embedding（KV 131072；bolt-spec-long = 32k 备份）
   engines/bolt-vision/      C-RADIO 视觉引擎
   scripts/            本仓库 deploy/ 下的脚本
   inputs/             本仓库 deploy/inputs/
@@ -106,13 +108,13 @@ bash /zeekr_data/llm/scripts/mk-spec-variant.sh <newTag> <draftOnnxDir> 8 bolt-s
 
 ```bash
 # 服务（OpenAI 兼容，端口 8081；自动补 10.0.0.3 地址与 24576 大页池）
-bash /zeekr_data/llm/scripts/server-bolt.sh 8081 bolt-spec-long 6
+bash /zeekr_data/llm/scripts/server-bolt.sh 8081 bolt-spec-128k 6
 python3 /zeekr_data/llm/scripts/api-bench.py 8081          # 代码/英文/中文 512 token 基准
 # 命令行单次推理 / 基准
 bash /zeekr_data/llm/scripts/run-bolt-best.sh /zeekr_data/llm/inputs/code_512.json 6
 bash /zeekr_data/llm/scripts/sweep-fold.sh <draftOnnxDir> <tag>        # block 2–8 扫描
 # 图文
-bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-long /zeekr_data/llm/inputs/image_panda.json --specDecode --dflashBlockSize 6
+bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-128k /zeekr_data/llm/inputs/image_panda.json --specDecode --dflashBlockSize 6
 ```
 
 服务请求示例：`POST /v1/chat/completions`，`{"model":"nemotron-bolt-74b","messages":[...],"max_tokens":512,"chat_template_kwargs":{"enable_thinking":false}}`，支持 `stream`。

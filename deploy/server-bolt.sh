@@ -1,8 +1,8 @@
 #!/bin/bash
 # OpenAI-compatible server for Bolt 74B with DFlash speculative decoding (no curl on the board: use python).
-# usage: server-bolt.sh [port=8081] [engineTag=bolt-spec-long] [block=6]
+# usage: server-bolt.sh [port=8081] [engineTag=bolt-spec-128k] [block=6]
 source /zeekr_data/llm/scripts/env.sh; L=$LLM_HOME
-PORT=${1:-8081}; TAG=${2:-bolt-spec-long}; BLK=${3:-6}
+PORT=${1:-8081}; TAG=${2:-bolt-spec-128k}; BLK=${3:-6}
 grep -q "HugePages_Total: *24576" /proc/meminfo || echo "${BOARD_SUDO_PW:-nvidia}" | sudo -S bash -c "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; sysctl -w vm.nr_hugepages=24576" >/dev/null 2>&1
 ip -4 addr show | grep -q "10.0.0.3/" || echo "${BOARD_SUDO_PW:-nvidia}" | sudo -S ip addr add 10.0.0.3/24 dev $(ip -o -4 addr show | grep "10.0.0.2/" | awk '{print $2}' | head -1) 2>/dev/null
 mkdir -p $L/logs
