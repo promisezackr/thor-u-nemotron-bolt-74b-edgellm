@@ -48,7 +48,19 @@ Block 大小扫描（代码 512，单路）：
 | 英文 512 | 374 | 322 ms | 50.0 | 48.0 |
 | 中文 512 | 512 | 367 ms | 50.2 | 48.5 |
 
-### 2.3 成本结构（为什么单路停在 ~55）
+### 2.3 长提示（分块 prefill，服务实测）
+
+A16 MoE 插件限制单次 prefill ≤ 4096 token（引擎 maxInputLen 2048 × batch 2），超长提示由运行时补丁自动分块（每块 ≤ maxInputLen，Mamba/KV 状态经常驻槽位接续，DFlash 草稿按块做 round-0 prefill），上限 = 引擎 KV 容量。
+
+| 提示 token | TTFT | 纯解码 t/s | 答案（首尾各埋一个暗号词） |
+|---|---|---|---|
+| 7,464 | 2.8 s | 44.6 | 正确 |
+| 14,864 | 5.5 s | 47.2 | 正确 |
+| 29,664 | 10.9 s | 46.2 | 正确 |
+
+prefill 吞吐约 2.7k token/s（分块 2048）。
+
+### 2.4 成本结构（为什么单路停在 ~55）
 
 每轮验证读取 ≈ 4.9 GB 非专家权重 + N × 1.4–1.8 GB 路由专家（N = block），block 6 约 16 GB → 理论 63 ms，实测 69 ms（带宽效率 92%）。单路 80 t/s 需要每轮 ≥ 5.5 token 且 ≤ 70 ms，在 4-bit 专家下不可达；需 2-bit 级专家或更高带宽硬件。
 
@@ -88,7 +100,7 @@ bash /zeekr_data/llm/scripts/build-bolt-long.sh /zeekr_map/llm/models/<bolt-edge
 bash /zeekr_data/llm/scripts/mk-spec-variant.sh <newTag> <draftOnnxDir> 8 bolt-spec-long
 ```
 
-限制：A16 MoE 插件只接受 `maxBatchSize × maxInputLen ≤ 4096`；草稿引擎 `--maxDraftTreeSize 8`（tree 6/16 均更差）。`llm_build` 偶发在 TensorRT 编译阶段卡死，脚本内置 timeout + 重试。
+限制：A16 MoE 插件只接受 `maxBatchSize × maxInputLen ≤ 4096`，长提示靠补丁中的分块 prefill（`EDGELLM_PREFILL_CHUNK` 可再调小块长）；上下文上限由 `--maxKVCacheCapacity` 决定（`build-bolt-128k.sh` 从保留的瘦身 ONNX 重建 128k KV 引擎，KV 每 token 仅约 8 KB）。草稿引擎 `--maxDraftTreeSize 8`（tree 6/16 均更差）。`llm_build` 偶发在 TensorRT 编译阶段卡死，脚本内置 timeout + 重试。
 
 ### 3.4 运行
 
@@ -108,7 +120,7 @@ bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-long /zeekr_data/llm/i
 注意事项：
 - 板子默认账号 nvidia/nvidia（脚本中 `BOARD_SUDO_PW` 可覆盖）；本板无开机钩子，重启后需手动运行 `server-bolt.sh`，IP 10.0.0.3 会回退为默认 10.0.0.2。
 - 服务常驻占用约 46 GB GPU 内存；跑引擎构建或其他 GPU 任务前先 `pkill -x llm_server`。
-- `llm_server` 对 DFlash 必须 `--specDraftStep 1`（脚本已带）；板上无 curl，健康检查用 python。
+- `llm_server` 对 DFlash 必须 `--specDraftStep 1`（脚本已带）；板上无 curl，健康检查用 python；`long-prompt-test.py [port] [tokens]` 做长提示回归。
 - 导出后用 `deploy/reexternalize.py` 复用外置专家权重，避免再写 37 GB；core dump 落在 /zeekr_data/logs/core，`env.sh` 已 `ulimit -c 0`。
 
 ## 4. 关键修复（补丁内容）
@@ -117,3 +129,4 @@ bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-long /zeekr_data/llm/i
 - `models/lilicorr/`：LiLiCorr 草稿（DFlash2 卷积层 + SWA/sink 注意力 + 折叠展开），导出后处理 `onnx_dtype_fixup.py`（TensorRT 混合精度），避开 CumSum / softmax-gather 融合 / Expand（Myelin 内部错误）。
 - `nemotron_h`：按层 MoE 配置（异构专家数）、DFlash 目标层捕获、NVFP4 A16 q/k/v 用 `qkv_concat`。
 - `llmBuilder.cpp`：DFlash 草稿 profile 最小行数；`dflashDecoder.cpp`：可选 LiLiCorr 相关性头走线（实测无增益，默认关闭）。
+- `llmRankRuntime.cpp`：分块 prefill（单请求、文本、vanilla/DFlash；草稿按块 round-0 prefill），`tensor.cpp`：reshape 失败打印张量名/容量。

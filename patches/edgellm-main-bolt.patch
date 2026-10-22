@@ -133,6 +133,27 @@ index bdbfedb..495c23f 100644
  
      //! Set up optimization profiles for Gemma4 assistant draft models.
      //! Gemma4 assistants read base embeddings, target hidden states, target KV,
+diff --git a/cpp/common/tensor.cpp b/cpp/common/tensor.cpp
+index 1a293f0..ce13279 100644
+--- a/cpp/common/tensor.cpp
++++ b/cpp/common/tensor.cpp
+@@ -337,11 +337,16 @@ bool Tensor::reshape(Coords shape) noexcept
+ {
+     if (!ownMemory)
+     {
++        LOG_WARNING("Tensor %s: reshape to %s refused (tensor does not own its memory)", mName.c_str(),
++            shape.formatString().c_str());
+         return false;
+     }
+ 
+     if (static_cast<int64_t>(shape.volume() * utils::getTypeSize(mDataType)) > memoryCapacity)
+     {
++        LOG_WARNING("Tensor %s: reshape to %s needs %ld bytes but capacity is %ld bytes", mName.c_str(),
++            shape.formatString().c_str(),
++            static_cast<long>(shape.volume() * utils::getTypeSize(mDataType)), static_cast<long>(memoryCapacity));
+         return false;
+     }
+ 
 diff --git a/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp b/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp
 index cff6068..1cc6ddf 100644
 --- a/cpp/kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.cpp
@@ -529,6 +550,1159 @@ index 4fcd01d..3480fa1 100644
      bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context);
      bool prepareV2Proposal(DecodingInferenceContext& context);
      bool captureDraftCudaGraphs(cudaStream_t stream);
+diff --git a/cpp/runtime/llmRankRuntime.cpp b/cpp/runtime/llmRankRuntime.cpp
+index 420b757..62ea704 100644
+--- a/cpp/runtime/llmRankRuntime.cpp
++++ b/cpp/runtime/llmRankRuntime.cpp
+@@ -2160,6 +2160,10 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
+         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
+         prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *managedRequest);
+     }
++    else if (mChunkedPrefill)
++    {
++        prefillStatus = runChunkedPrefill(context, decodingStrategy, managedRequest != nullptr);
++    }
+     else
+     {
+         prefillStatus = runBaseModelPrefill(context, managedRequest);
+@@ -2170,7 +2174,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
+         return nullptr;
+     }
+ 
+-    if (managedRequest != nullptr && !decodingStrategy.initializeForGeneration(context))
++    if (managedRequest != nullptr && !mChunkedPrefill && !decodingStrategy.initializeForGeneration(context))
+     {
+         LOG_ERROR("Failed to initialize generation state for %s decoding strategy.", decodingStrategy.name());
+         return nullptr;
+@@ -2807,6 +2811,80 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
+     return true;
+ }
+ 
++namespace
++{
++//! Optional prefill chunk cap (EDGELLM_PREFILL_CHUNK); 0 when unset/invalid.
++int32_t prefillChunkOverride() noexcept
++{
++    char const* env = std::getenv("EDGELLM_PREFILL_CHUNK");
++    int32_t const v = env != nullptr ? std::atoi(env) : 0;
++    return v > 0 ? v : 0;
++}
++} // namespace
++
++bool LLMRankRuntime::runChunkedPrefill(
++    DecodingInferenceContext& context, DecodingStrategy& strategy, bool initializeStrategy)
++{
++    ELLM_CHECK(context.activeBatchSize == 1, "Chunked prefill supports a single request only.");
++    std::vector<int32_t> const full = context.tokenIds[0];
++    int32_t const total = context.effectivePrefillLengths[0];
++    ELLM_CHECK(total > 0 && static_cast<size_t>(total) <= full.size(), "Chunked prefill: invalid prefill length.");
++    bool const hasDraft = strategy.isSpeculative();
++    int32_t chunk = mDeployment.base.maxSupportedInputLength;
++    if (hasDraft && mDeployment.draft.has_value())
++    {
++        chunk = std::min(chunk, mDeployment.draft->maxSupportedInputLength);
++    }
++    if (int32_t const override = prefillChunkOverride(); override > 0)
++    {
++        chunk = std::min(chunk, override);
++    }
++    ELLM_CHECK(chunk > 0, "Chunked prefill: invalid chunk size.");
++    LOG_INFO("Chunked prefill: %d tokens in chunks of %d.", total, chunk);
++    for (int32_t offset = 0; offset < total; offset += chunk)
++    {
++        int32_t const len = std::min(chunk, total - offset);
++        bool const last = offset + len >= total;
++        context.tokenIds[0].assign(full.begin() + offset, full.begin() + offset + len);
++        context.effectivePrefillLengths[0] = len;
++        if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/last))
++        {
++            LOG_ERROR("Chunked prefill: base prefill failed at offset %d (len %d).", offset, len);
++            return false;
++        }
++        if (hasDraft)
++        {
++            if (!last)
++            {
++                // Non-sampling chunk: sync before the draft repacks the shared pinned token buffer.
++                CUDA_CHECK(cudaStreamSynchronize(context.stream));
++            }
++            // DFlash round-0 draft prefill over this chunk's base hidden states (always, even without a managed KV
++            // request: the decode loop's round-0 draft pass would otherwise bind the whole prompt length against
++            // baseHiddenStates, which only holds the last chunk). The draft cache manager commits the chunk length so
++            // the next chunk appends at the right positions; the last chunk (after sampling) leaves the real pending
++            // proposal that round 0 consumes.
++            if (!strategy.initializeForGeneration(context))
++            {
++                LOG_ERROR("Chunked prefill: draft prefill failed at offset %d (len %d).", offset, len);
++                return false;
++            }
++        }
++        LOG_DEBUG("Chunked prefill: chunk [%d, %d) of %d done.", offset, offset + len, total);
++    }
++    // Restore full-prompt bookkeeping: the last chunk's sampling appended the first generated token.
++    int32_t const sampledToken = context.tokenIds[0].back();
++    context.tokenIds[0] = full;
++    context.tokenIds[0].push_back(sampledToken);
++    context.effectivePrefillLengths[0] = total;
++    if (!hasDraft && initializeStrategy && !strategy.initializeForGeneration(context))
++    {
++        LOG_ERROR("Chunked prefill: strategy initialization failed.");
++        return false;
++    }
++    return true;
++}
++
+ bool LLMRankRuntime::runHybridMtpPrefill(
+     DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest& managedKVCacheRequest)
+ {
+@@ -3582,6 +3660,7 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
+     std::vector<int32_t> const* contextCachePrefillStarts)
+ {
+     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
++    mChunkedPrefill = false;
+ 
+     // LoRA switching goes through the LoRAManager on SharedResources.
+     if (mDeployment.base.maxSupportedLoraRank > 0 && mSharedResources->loraManager)
+@@ -3709,13 +3788,28 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
+         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+     if (maxInputLength > mDeployment.base.maxSupportedInputLength)
+     {
+-        LOG_ERROR(
+-            "Prefill length after context reuse (%d) exceeds engine max input length (%d). "
+-            "Rebuild the engine with a larger --maxInputLen.",
+-            maxInputLength, mDeployment.base.maxSupportedInputLength);
+-        throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: prefill length " + std::to_string(maxInputLength)
+-            + " exceeds engine max_input_len " + std::to_string(mDeployment.base.maxSupportedInputLength)
+-            + " (rebuild engine with a larger --maxInputLen)");
++        // Chunked prefill: one text-only sequence, no context-cache prefill starts, vanilla or DFlash decoding
++        // (MTP/EAGLE drafts need their own boundary handling and keep the hard error).
++        bool const textOnly = !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value();
++        bool const chunkable = context.activeBatchSize == 1 && contextCachePrefillStarts == nullptr && textOnly
++            && !mDeployment.base.isDiffusionBackbone
++            && (!strategy.isSpeculative() || strategy.kind() == DecodingStrategyKind::kDFlash);
++        if (chunkable)
++        {
++            mChunkedPrefill = true;
++            LOG_INFO("Prefill length %d exceeds engine max input length %d: using chunked prefill.", maxInputLength,
++                mDeployment.base.maxSupportedInputLength);
++        }
++        else
++        {
++            LOG_ERROR(
++                "Prefill length after context reuse (%d) exceeds engine max input length (%d). "
++                "Rebuild the engine with a larger --maxInputLen.",
++                maxInputLength, mDeployment.base.maxSupportedInputLength);
++            throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: prefill length " + std::to_string(maxInputLength)
++                + " exceeds engine max_input_len " + std::to_string(mDeployment.base.maxSupportedInputLength)
++                + " (rebuild engine with a larger --maxInputLen)");
++        }
+     }
+ 
+     if (contextCachePrefillStarts == nullptr)
+diff --git a/cpp/runtime/llmRankRuntime.h b/cpp/runtime/llmRankRuntime.h
+index d3ece92..ae18209 100644
+--- a/cpp/runtime/llmRankRuntime.h
++++ b/cpp/runtime/llmRankRuntime.h
+@@ -659,6 +659,14 @@ private:
+     bool runBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest = nullptr,
+         bool sampleOutput = true);
+ 
++    //! Chunked prefill for a single text-only request whose (post-reuse) prefill length exceeds the engine's max
++    //! input length: runs runBaseModelPrefill per chunk of <= maxInputLen tokens (sampling only on the last chunk) so
++    //! KV, Mamba/conv state carry over through the resident slot; a DFlash draft runs its round-0 prefill per chunk
++    //! so the draft KV covers the whole prompt. Enabled by setUpForPrefillExecution (mChunkedPrefill);
++    //! EDGELLM_PREFILL_CHUNK caps the chunk size.
++    bool runChunkedPrefill(DecodingInferenceContext& context, DecodingStrategy& strategy, bool initializeStrategy);
++    bool mChunkedPrefill{false};
++
+     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
+     //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary
+     //! hidden into the draft prefill on a cache hit, and driving the coordinator's dedicated MTP publish entrypoint.
+diff --git a/examples/llm/CMakeLists.txt b/examples/llm/CMakeLists.txt
+index b4256f3..dd42f10 100644
+--- a/examples/llm/CMakeLists.txt
++++ b/examples/llm/CMakeLists.txt
+@@ -25,6 +25,14 @@ target_include_directories(
+                         ${CMAKE_SOURCE_DIR}/examples/utils)
+ add_cross_build_link_options(llm_inference)
+ 
++add_executable(llm_server llm_server.cpp)
++target_link_libraries(llm_server PRIVATE edgellmCore exampleUtils
++                                            commonLibraryExt)
++target_include_directories(
++  llm_server PRIVATE ${COMMON_INCLUDE_DIRS}
++                        ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(llm_server)
++
+ add_executable(llm_stream llm_stream.cpp)
+ target_link_libraries(llm_stream PRIVATE edgellmCore exampleUtils
+                                          commonLibraryExt)
+diff --git a/examples/llm/llm_server.cpp b/examples/llm/llm_server.cpp
+new file mode 100755
+index 0000000..e9568da
+--- /dev/null
++++ b/examples/llm/llm_server.cpp
+@@ -0,0 +1,960 @@
++/*
++ * llm_server: minimal OpenAI-compatible HTTP server on top of the TensorRT Edge-LLM runtime.
++ *
++ * Loads one engine directory once, keeps it resident, and serves
++ *   POST /v1/chat/completions   (stream: true -> SSE; stream: false -> JSON)
++ *   GET  /v1/models
++ *   GET  /health
++ * Requests are executed one at a time (single GPU engine, serialized by a mutex).
++ * Tools: OpenAI `tools` are rendered into the system prompt in Qwen's native format and
++ * `<tool_call>{...}</tool_call>` blocks in the output are returned as `tool_calls`.
++ * No external HTTP library: a small HTTP/1.1 parser over POSIX sockets (single request per connection).
++ */
++
++#include "common/checkMacros.h"
++#include "common/trtUtils.h"
++#include "runtime/llmInferenceRuntime.h"
++#include "runtime/llmRuntimeUtils.h"
++#include "runtime/streaming.h"
++
++#include <nlohmann/json.hpp>
++
++#include <arpa/inet.h>
++#include <atomic>
++#include <chrono>
++#include <csignal>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <string>
++#include <sys/socket.h>
++#include <thread>
++#include <unistd.h>
++#include <unordered_map>
++#include <vector>
++
++using namespace trt_edgellm;
++using json = nlohmann::json;
++
++namespace
++{
++
++struct Args
++{
++    std::string engineDir;
++    std::string host{"0.0.0.0"};
++    int port{8081};
++    std::string modelName{"qwen3.8-27b"};
++    bool specDecode{false};
++    int32_t specDraftTopK{2};
++    int32_t specDraftStep{6};
++    int32_t specVerifySize{16};
++    int32_t dflashBlockSize{0};
++    int64_t defaultMaxTokens{1024};
++    int64_t maxTokensCap{4096};
++    int32_t streamInterval{1};
++    bool defaultThinking{false};
++};
++
++void printUsage(char const* argv0)
++{
++    std::cerr << "Usage: " << argv0
++              << " --engineDir DIR [--host 0.0.0.0] [--port 8081] [--model NAME] [--specDecode]"
++                 " [--specDraftTopK N] [--specDraftStep N] [--specVerifySize N] [--dflashBlockSize N]"
++                 " [--maxTokens N] [--maxTokensCap N] [--streamInterval N] [--defaultThinking]\n";
++}
++
++bool parseArgs(int argc, char** argv, Args& a)
++{
++    for (int i = 1; i < argc; ++i)
++    {
++        std::string const k = argv[i];
++        auto next = [&](std::string& out) {
++            if (i + 1 >= argc)
++            {
++                return false;
++            }
++            out = argv[++i];
++            return true;
++        };
++        std::string v;
++        if (k == "--engineDir" && next(v))
++            a.engineDir = v;
++        else if (k == "--host" && next(v))
++            a.host = v;
++        else if (k == "--port" && next(v))
++            a.port = std::stoi(v);
++        else if (k == "--model" && next(v))
++            a.modelName = v;
++        else if (k == "--specDecode")
++            a.specDecode = true;
++        else if (k == "--specDraftTopK" && next(v))
++            a.specDraftTopK = std::stoi(v);
++        else if (k == "--specDraftStep" && next(v))
++            a.specDraftStep = std::stoi(v);
++        else if (k == "--specVerifySize" && next(v))
++            a.specVerifySize = std::stoi(v);
++        else if (k == "--dflashBlockSize" && next(v))
++            a.dflashBlockSize = std::stoi(v);
++        else if (k == "--maxTokens" && next(v))
++            a.defaultMaxTokens = std::stoll(v);
++        else if (k == "--maxTokensCap" && next(v))
++            a.maxTokensCap = std::stoll(v);
++        else if (k == "--streamInterval" && next(v))
++            a.streamInterval = std::stoi(v);
++        else if (k == "--defaultThinking")
++            a.defaultThinking = true;
++        else if (k == "-h" || k == "--help")
++        {
++            printUsage(argv[0]);
++            return false;
++        }
++        else
++        {
++            std::cerr << "Unknown or incomplete option: " << k << "\n";
++            printUsage(argv[0]);
++            return false;
++        }
++    }
++    if (a.engineDir.empty())
++    {
++        printUsage(argv[0]);
++        return false;
++    }
++    return true;
++}
++
++// ---------------------------------------------------------------- tiny HTTP
++
++struct HttpRequest
++{
++    std::string method;
++    std::string path;
++    std::unordered_map<std::string, std::string> headers; // lower-case keys
++    std::string body;
++};
++
++bool sendAll(int fd, char const* data, size_t len)
++{
++    while (len > 0)
++    {
++        ssize_t const n = ::send(fd, data, len, MSG_NOSIGNAL);
++        if (n <= 0)
++        {
++            return false;
++        }
++        data += n;
++        len -= static_cast<size_t>(n);
++    }
++    return true;
++}
++
++bool sendAll(int fd, std::string const& s)
++{
++    return sendAll(fd, s.data(), s.size());
++}
++
++std::string toLower(std::string s)
++{
++    for (auto& c : s)
++    {
++        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    }
++    return s;
++}
++
++bool readRequest(int fd, HttpRequest& req)
++{
++    std::string buf;
++    char tmp[8192];
++    size_t headerEnd = std::string::npos;
++    while (headerEnd == std::string::npos)
++    {
++        ssize_t const n = ::recv(fd, tmp, sizeof(tmp), 0);
++        if (n <= 0)
++        {
++            return false;
++        }
++        buf.append(tmp, static_cast<size_t>(n));
++        headerEnd = buf.find("\r\n\r\n");
++        if (buf.size() > (1u << 20))
++        {
++            return false;
++        }
++    }
++    std::string const head = buf.substr(0, headerEnd);
++    std::string rest = buf.substr(headerEnd + 4);
++    size_t pos = 0;
++    size_t lineEnd = head.find("\r\n");
++    std::string const reqLine = head.substr(0, lineEnd);
++    {
++        size_t const s1 = reqLine.find(' ');
++        size_t const s2 = reqLine.find(' ', s1 + 1);
++        if (s1 == std::string::npos || s2 == std::string::npos)
++        {
++            return false;
++        }
++        req.method = reqLine.substr(0, s1);
++        req.path = reqLine.substr(s1 + 1, s2 - s1 - 1);
++    }
++    pos = (lineEnd == std::string::npos) ? head.size() : lineEnd + 2;
++    while (pos < head.size())
++    {
++        size_t e = head.find("\r\n", pos);
++        if (e == std::string::npos)
++        {
++            e = head.size();
++        }
++        std::string const line = head.substr(pos, e - pos);
++        size_t const c = line.find(':');
++        if (c != std::string::npos)
++        {
++            std::string key = toLower(line.substr(0, c));
++            std::string val = line.substr(c + 1);
++            while (!val.empty() && (val.front() == ' ' || val.front() == '\t'))
++            {
++                val.erase(val.begin());
++            }
++            req.headers[key] = val;
++        }
++        pos = e + 2;
++    }
++    size_t contentLength = 0;
++    if (auto it = req.headers.find("content-length"); it != req.headers.end())
++    {
++        contentLength = static_cast<size_t>(std::stoull(it->second));
++    }
++    if (contentLength > (64u << 20))
++    {
++        return false;
++    }
++    while (rest.size() < contentLength)
++    {
++        ssize_t const n = ::recv(fd, tmp, sizeof(tmp), 0);
++        if (n <= 0)
++        {
++            return false;
++        }
++        rest.append(tmp, static_cast<size_t>(n));
++    }
++    req.body = rest.substr(0, contentLength);
++    return true;
++}
++
++void sendJson(int fd, int status, json const& body)
++{
++    std::string const payload = body.dump();
++    char const* reason = status == 200 ? "OK" : (status == 400 ? "Bad Request" : (status == 404 ? "Not Found" : "Error"));
++    std::string head = "HTTP/1.1 " + std::to_string(status) + " " + reason
++        + "\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: "
++        + std::to_string(payload.size()) + "\r\n\r\n";
++    sendAll(fd, head);
++    sendAll(fd, payload);
++}
++
++bool sendChunk(int fd, std::string const& data)
++{
++    char lenbuf[32];
++    std::snprintf(lenbuf, sizeof(lenbuf), "%zx\r\n", data.size());
++    return sendAll(fd, lenbuf) && sendAll(fd, data) && sendAll(fd, "\r\n");
++}
++
++// ------------------------------------------------------------- OpenAI glue
++
++std::string nowId()
++{
++    return "chatcmpl-" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::system_clock::now().time_since_epoch())
++                                            .count());
++}
++
++std::string contentToText(json const& content)
++{
++    if (content.is_string())
++    {
++        return content.get<std::string>();
++    }
++    if (content.is_array())
++    {
++        std::string out;
++        for (auto const& part : content)
++        {
++            if (part.is_object() && part.value("type", "") == "text")
++            {
++                out += part.value("text", "");
++            }
++            else if (part.is_string())
++            {
++                out += part.get<std::string>();
++            }
++        }
++        return out;
++    }
++    if (content.is_null())
++    {
++        return "";
++    }
++    return content.dump();
++}
++
++// Qwen-native tool block, as the official chat template renders it.
++std::string renderToolsSystemBlock(json const& tools)
++{
++    std::string s = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
++                    "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
++    for (auto const& t : tools)
++    {
++        s += t.dump() + "\n";
++    }
++    s += "</tools>\n\nFor each function call, return a json object with function name and arguments within "
++         "<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
++         "</tool_call>";
++    return s;
++}
++
++rt::Message textMessage(std::string const& role, std::string const& text)
++{
++    rt::Message m;
++    m.role = role;
++    rt::Message::MessageContent c;
++    c.type = "text";
++    c.content = text;
++    m.contents.push_back(c);
++    return m;
++}
++
++// Converts OpenAI messages (+tools) into runtime messages.
++std::vector<rt::Message> buildMessages(json const& body)
++{
++    std::vector<rt::Message> out;
++    json const& msgs = body.at("messages");
++    std::string systemText;
++    bool haveSystem = false;
++    std::vector<rt::Message> rest;
++    for (auto const& m : msgs)
++    {
++        std::string const role = m.value("role", "user");
++        if (role == "system" || role == "developer")
++        {
++            if (haveSystem)
++            {
++                systemText += "\n\n";
++            }
++            systemText += contentToText(m.value("content", json()));
++            haveSystem = true;
++        }
++        else if (role == "tool")
++        {
++            // Qwen renders tool results inside a user turn as <tool_response> blocks.
++            std::string const text = "<tool_response>\n" + contentToText(m.value("content", json())) + "\n</tool_response>";
++            if (!rest.empty() && rest.back().role == "user" && rest.back().contents.size() == 1
++                && rest.back().contents[0].content.rfind("<tool_response>", 0) == 0)
++            {
++                rest.back().contents[0].content += "\n" + text;
++            }
++            else
++            {
++                rest.push_back(textMessage("user", text));
++            }
++        }
++        else if (role == "assistant")
++        {
++            std::string text = contentToText(m.value("content", json()));
++            if (m.contains("tool_calls") && m["tool_calls"].is_array())
++            {
++                for (auto const& tc : m["tool_calls"])
++                {
++                    json call;
++                    call["name"] = tc.value("function", json::object()).value("name", "");
++                    std::string args = tc.value("function", json::object()).value("arguments", "{}");
++                    try
++                    {
++                        call["arguments"] = json::parse(args);
++                    }
++                    catch (...)
++                    {
++                        call["arguments"] = args;
++                    }
++                    if (!text.empty())
++                    {
++                        text += "\n";
++                    }
++                    text += "<tool_call>\n" + call.dump() + "\n</tool_call>";
++                }
++            }
++            rest.push_back(textMessage("assistant", text));
++        }
++        else
++        {
++            rest.push_back(textMessage("user", contentToText(m.value("content", json()))));
++        }
++    }
++    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
++    {
++        if (haveSystem)
++        {
++            systemText += "\n\n";
++        }
++        systemText += renderToolsSystemBlock(body["tools"]);
++        haveSystem = true;
++    }
++    if (haveSystem)
++    {
++        out.push_back(textMessage("system", systemText));
++    }
++    out.insert(out.end(), rest.begin(), rest.end());
++    return out;
++}
++
++// Extracts <tool_call>...</tool_call> blocks; returns remaining text and the OpenAI tool_calls array.
++json extractToolCalls(std::string& text)
++{
++    json calls = json::array();
++    std::string const open = "<tool_call>";
++    std::string const close = "</tool_call>";
++    size_t pos = 0;
++    std::string cleaned;
++    while (true)
++    {
++        size_t const a = text.find(open, pos);
++        if (a == std::string::npos)
++        {
++            cleaned += text.substr(pos);
++            break;
++        }
++        cleaned += text.substr(pos, a - pos);
++        size_t const b = text.find(close, a + open.size());
++        if (b == std::string::npos)
++        {
++            cleaned += text.substr(a);
++            break;
++        }
++        std::string inner = text.substr(a + open.size(), b - a - open.size());
++        try
++        {
++            json j = json::parse(inner);
++            json call;
++            call["id"] = "call_" + std::to_string(calls.size() + 1);
++            call["type"] = "function";
++            call["function"]["name"] = j.value("name", "");
++            json args = j.value("arguments", json::object());
++            call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump();
++            calls.push_back(call);
++        }
++        catch (...)
++        {
++            cleaned += text.substr(a, b + close.size() - a);
++        }
++        pos = b + close.size();
++    }
++    while (!cleaned.empty() && (cleaned.back() == '\n' || cleaned.back() == ' '))
++    {
++        cleaned.pop_back();
++    }
++    text = cleaned;
++    return calls;
++}
++
++std::string stripControlTokens(std::string text)
++{
++    for (char const* tok : {"<|im_end|>", "<|endoftext|>", "<|im_start|>"})
++    {
++        size_t p;
++        while ((p = text.find(tok)) != std::string::npos)
++        {
++            text.erase(p, std::strlen(tok));
++        }
++    }
++    return text;
++}
++
++// Splits a leading <think>...</think> block into reasoning; returns the remaining text.
++std::string splitReasoning(std::string const& text, std::string& reasoning)
++{
++    size_t const b = text.find("</think>");
++    if (b == std::string::npos)
++    {
++        return text;
++    }
++    // With thinking enabled the template opens <think> inside the prompt, so the output may carry only the
++    // closing tag: everything before </think> is reasoning.
++    size_t a = text.find("<think>");
++    size_t const start = (a == std::string::npos || a > b) ? 0 : a + 7;
++    a = (a == std::string::npos || a > b) ? 0 : a;
++    reasoning = text.substr(start, b - start);
++    while (!reasoning.empty() && (reasoning.front() == '\n' || reasoning.front() == ' '))
++    {
++        reasoning.erase(reasoning.begin());
++    }
++    std::string rest = text.substr(0, a) + text.substr(b + 8);
++    size_t i = 0;
++    while (i < rest.size() && (rest[i] == '\n' || rest[i] == ' '))
++    {
++        ++i;
++    }
++    return rest.substr(i);
++}
++
++char const* openaiFinish(rt::FinishReason r, bool hadToolCalls)
++{
++    if (hadToolCalls)
++    {
++        return "tool_calls";
++    }
++    switch (r)
++    {
++    case rt::FinishReason::kLength: return "length";
++    case rt::FinishReason::kCancelled: return "stop";
++    case rt::FinishReason::kError: return "error";
++    default: return "stop";
++    }
++}
++
++// ------------------------------------------------------------------ server
++
++struct Server
++{
++    Args args;
++    rt::LLMInferenceRuntime* runtime{nullptr};
++    cudaStream_t stream{};
++    std::mutex genMutex;
++    std::atomic<uint64_t> served{0};
++};
++
++void handleChat(Server& S, int fd, json const& body)
++{
++    bool const streaming = body.value("stream", false);
++    rt::LLMGenerationRequest req;
++    rt::LLMGenerationRequest::Request r;
++    r.messages = buildMessages(body);
++    if (body.contains("stop"))
++    {
++        if (body["stop"].is_string())
++        {
++            r.stopStrings.push_back(body["stop"].get<std::string>());
++        }
++        else if (body["stop"].is_array())
++        {
++            for (auto const& s : body["stop"])
++            {
++                if (s.is_string())
++                {
++                    r.stopStrings.push_back(s.get<std::string>());
++                }
++            }
++        }
++    }
++    req.requests.push_back(std::move(r));
++    req.temperature = body.value("temperature", 0.0f);
++    req.topP = body.value("top_p", 0.8f);
++    req.topK = body.value("top_k", 20);
++    int64_t maxTokens = body.value("max_tokens", body.value("max_completion_tokens", S.args.defaultMaxTokens));
++    if (maxTokens <= 0)
++    {
++        maxTokens = S.args.defaultMaxTokens;
++    }
++    req.maxGenerateLength = std::min<int64_t>(maxTokens, S.args.maxTokensCap);
++    bool thinking = S.args.defaultThinking;
++    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
++    {
++        thinking = body["chat_template_kwargs"].value("enable_thinking", thinking);
++    }
++    thinking = body.value("enable_thinking", thinking);
++    req.enableThinking = thinking;
++
++    auto ch = rt::StreamChannel::create();
++    ch->setStreamInterval(S.args.streamInterval);
++    ch->setSkipSpecialTokens(false); // keep <tool_call>/<think>; chat-control tokens are stripped below
++    req.streamChannels.push_back(ch);
++
++    std::string const id = nowId();
++    long const created = static_cast<long>(std::time(nullptr));
++    std::string const model = body.value("model", S.args.modelName);
++
++    std::lock_guard<std::mutex> lock(S.genMutex);
++    auto const t0 = std::chrono::steady_clock::now();
++    rt::LLMGenerationResponse response;
++    std::atomic<bool> workerOk{false};
++    std::string workerError;
++    std::mutex workerErrorMutex;
++    std::thread worker([&] {
++        try
++        {
++            workerOk = S.runtime->handleRequest(req, response, S.stream);
++        }
++        catch (std::exception const& e)
++        {
++            std::lock_guard<std::mutex> g(workerErrorMutex);
++            workerError = e.what();
++            std::cerr << "handleRequest failed: " << workerError << "\n";
++            workerOk = false;
++        }
++        // A request rejected before generation (e.g. input too long) never finishes the channel:
++        // cancel it so the consumer loop below returns instead of blocking the server forever.
++        if (!ch->isFinished())
++        {
++            ch->cancel();
++        }
++    });
++
++    std::string fullText;
++    size_t tokensOut = 0;
++    int32_t promptTokens = -1;
++    rt::FinishReason reason = rt::FinishReason::kNotFinished;
++    bool clientGone = false;
++    bool headerSent = false;
++    double ttftMs = 0.0;
++
++    if (streaming)
++    {
++        std::string const head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
++                                 "Access-Control-Allow-Origin: *\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
++        headerSent = sendAll(fd, head);
++        json first;
++        first["id"] = id;
++        first["object"] = "chat.completion.chunk";
++        first["created"] = created;
++        first["model"] = model;
++        first["choices"] = json::array({json{{"index", 0}, {"delta", json{{"role", "assistant"}, {"content", ""}}}, {"finish_reason", nullptr}}});
++        if (!sendChunk(fd, "data: " + first.dump() + "\n\n"))
++        {
++            clientGone = true;
++        }
++    }
++
++    // Streaming state for thinking mode: the template opens <think> in the prompt, so the output is
++    // reasoning until </think>; deltas before that go out as reasoning_content.
++    bool inReasoning = thinking;
++    std::string pending;
++    auto emitDelta = [&](json const& delta) {
++        json chunk;
++        chunk["id"] = id;
++        chunk["object"] = "chat.completion.chunk";
++        chunk["created"] = created;
++        chunk["model"] = model;
++        chunk["choices"] = json::array({json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
++        if (!sendChunk(fd, "data: " + chunk.dump() + "\n\n"))
++        {
++            clientGone = true;
++            ch->cancel();
++        }
++    };
++    auto streamText = [&](std::string const& text) {
++        pending += text;
++        while (!pending.empty())
++        {
++            if (inReasoning)
++            {
++                size_t const e = pending.find("</think>");
++                if (e != std::string::npos)
++                {
++                    std::string r = pending.substr(0, e);
++                    if (!r.empty())
++                    {
++                        emitDelta(json{{"reasoning_content", r}});
++                    }
++                    pending.erase(0, e + 8);
++                    while (!pending.empty() && (pending.front() == '\n' || pending.front() == ' '))
++                    {
++                        pending.erase(pending.begin());
++                    }
++                    inReasoning = false;
++                    continue;
++                }
++                // keep a possible partial "</think>" suffix for the next delta
++                size_t keep = 0;
++                for (size_t k = std::min<size_t>(7, pending.size()); k > 0; --k)
++                {
++                    if (std::string("</think>").compare(0, k, pending.substr(pending.size() - k)) == 0)
++                    {
++                        keep = k;
++                        break;
++                    }
++                }
++                std::string r = pending.substr(0, pending.size() - keep);
++                if (!r.empty())
++                {
++                    emitDelta(json{{"reasoning_content", r}});
++                }
++                pending.erase(0, pending.size() - keep);
++                return;
++            }
++            if (pending.rfind("<think>", 0) == 0)
++            {
++                pending.erase(0, 7);
++                inReasoning = true;
++                continue;
++            }
++            emitDelta(json{{"content", pending}});
++            pending.clear();
++        }
++    };
++
++    ch->consume([&](rt::StreamChunk&& c) {
++        if (ttftMs == 0.0 && !c.tokenIds.empty())
++        {
++            ttftMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        }
++        if (c.promptTokenCount >= 0)
++        {
++            promptTokens = c.promptTokenCount;
++        }
++        tokensOut += c.tokenIds.size();
++        fullText += c.text;
++        if (c.finished)
++        {
++            reason = c.reason;
++        }
++        std::string const deltaText = stripControlTokens(c.text);
++        if (streaming && !clientGone && !deltaText.empty())
++        {
++            streamText(deltaText);
++        }
++    });
++    worker.join();
++    if (reason == rt::FinishReason::kNotFinished && ch->isFinished())
++    {
++        reason = ch->getReason();
++    }
++    double const totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    double const genMs = totalMs - ttftMs;
++    double const tps = (genMs > 0 && tokensOut > 1) ? (static_cast<double>(tokensOut - 1) / genMs * 1000.0) : 0.0;
++    ++S.served;
++    std::fprintf(stderr, "[req %llu] prompt_tokens=%d completion_tokens=%zu ttft=%.0fms total=%.0fms decode=%.1f tok/s finish=%s%s\n",
++        static_cast<unsigned long long>(S.served.load()), promptTokens, tokensOut, ttftMs, totalMs, tps,
++        rt::finishReasonName(reason), workerOk ? "" : " (worker error)");
++
++    if (!workerOk && tokensOut == 0)
++    {
++        std::string err;
++        {
++            std::lock_guard<std::mutex> g(workerErrorMutex);
++            err = workerError.empty() ? "generation failed" : workerError;
++        }
++        json e = json{{"error", json{{"message", err}, {"type", "invalid_request_error"}, {"code", "generation_failed"}}}};
++        if (streaming)
++        {
++            if (!clientGone)
++            {
++                sendChunk(fd, "data: " + e.dump() + "\n\n");
++                sendChunk(fd, "data: [DONE]\n\n");
++                sendAll(fd, "0\r\n\r\n");
++            }
++        }
++        else
++        {
++            sendJson(fd, 400, e);
++        }
++        return;
++    }
++
++    json usage;
++    usage["prompt_tokens"] = promptTokens < 0 ? 0 : promptTokens;
++    usage["completion_tokens"] = tokensOut;
++    usage["total_tokens"] = (promptTokens < 0 ? 0 : promptTokens) + static_cast<long>(tokensOut);
++
++    std::string reasoning;
++    std::string text = splitReasoning(stripControlTokens(fullText), reasoning);
++    json toolCalls = extractToolCalls(text);
++    bool const hadTools = !toolCalls.empty();
++
++    if (streaming)
++    {
++        if (!clientGone && !pending.empty())
++        {
++            emitDelta(json{{inReasoning ? "reasoning_content" : "content", pending}});
++            pending.clear();
++        }
++        if (!clientGone)
++        {
++            json last;
++            last["id"] = id;
++            last["object"] = "chat.completion.chunk";
++            last["created"] = created;
++            last["model"] = model;
++            json delta = json::object();
++            if (hadTools)
++            {
++                json tcs = json::array();
++                for (size_t i = 0; i < toolCalls.size(); ++i)
++                {
++                    json tc = toolCalls[i];
++                    tc["index"] = i;
++                    tcs.push_back(tc);
++                }
++                delta["tool_calls"] = tcs;
++            }
++            last["choices"] = json::array({json{{"index", 0}, {"delta", delta}, {"finish_reason", openaiFinish(reason, hadTools)}}});
++            last["usage"] = usage;
++            sendChunk(fd, "data: " + last.dump() + "\n\n");
++            sendChunk(fd, "data: [DONE]\n\n");
++            sendAll(fd, "0\r\n\r\n");
++        }
++        return;
++    }
++    (void) headerSent;
++    json out;
++    out["id"] = id;
++    out["object"] = "chat.completion";
++    out["created"] = created;
++    out["model"] = model;
++    json message;
++    message["role"] = "assistant";
++    message["content"] = hadTools && text.empty() ? json(nullptr) : json(text);
++    if (!reasoning.empty())
++    {
++        message["reasoning_content"] = reasoning;
++    }
++    if (hadTools)
++    {
++        message["tool_calls"] = toolCalls;
++    }
++    out["choices"] = json::array({json{{"index", 0}, {"message", message}, {"finish_reason", openaiFinish(reason, hadTools)}}});
++    out["usage"] = usage;
++    sendJson(fd, workerOk ? 200 : 500, out);
++}
++
++void handleConnection(Server& S, int fd)
++{
++    int one = 1;
++    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++    HttpRequest req;
++    if (!readRequest(fd, req))
++    {
++        ::close(fd);
++        return;
++    }
++    try
++    {
++        if (req.method == "OPTIONS")
++        {
++            std::string const head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
++                                     "Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
++                                     "Connection: close\r\nContent-Length: 0\r\n\r\n";
++            sendAll(fd, head);
++        }
++        else if (req.method == "GET" && (req.path == "/health" || req.path == "/"))
++        {
++            sendJson(fd, 200, json{{"status", "ok"}, {"model", S.args.modelName}, {"served", S.served.load()}});
++        }
++        else if (req.method == "GET" && (req.path == "/v1/models" || req.path == "/models"))
++        {
++            json m;
++            m["object"] = "list";
++            m["data"] = json::array({json{{"id", S.args.modelName}, {"object", "model"}, {"owned_by", "thor"}}});
++            sendJson(fd, 200, m);
++        }
++        else if (req.method == "POST" && (req.path == "/v1/chat/completions" || req.path == "/chat/completions"))
++        {
++            json body = json::parse(req.body);
++            if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty())
++            {
++                sendJson(fd, 400, json{{"error", json{{"message", "messages[] is required"}, {"type", "invalid_request_error"}}}});
++            }
++            else
++            {
++                handleChat(S, fd, body);
++            }
++        }
++        else
++        {
++            sendJson(fd, 404, json{{"error", json{{"message", "not found: " + req.method + " " + req.path}}}});
++        }
++    }
++    catch (std::exception const& e)
++    {
++        sendJson(fd, 400, json{{"error", json{{"message", e.what()}, {"type", "invalid_request_error"}}}});
++    }
++    ::shutdown(fd, SHUT_WR);
++    ::close(fd);
++}
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++    Args args;
++    if (!parseArgs(argc, argv, args))
++    {
++        return 1;
++    }
++    std::signal(SIGPIPE, SIG_IGN);
++
++    // TensorRT plugin library (EDGELLM_PLUGIN_PATH); handles must outlive the runtime.
++    auto pluginHandles = loadEdgellmPluginLib();
++
++    cudaStream_t stream;
++    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    std::unordered_map<std::string, std::string> loraMap;
++    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
++    try
++    {
++        if (args.specDecode)
++        {
++            rt::SpecDecodeDraftingConfig draft{};
++            draft.draftingTopK = args.specDraftTopK;
++            draft.draftingStep = args.specDraftStep;
++            draft.verifySize = args.specVerifySize;
++            draft.dflashBlockSize = args.dflashBlockSize;
++            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, "", loraMap, draft, stream);
++        }
++        else
++        {
++            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, "", loraMap, stream);
++        }
++    }
++    catch (std::exception const& e)
++    {
++        std::cerr << "Runtime init failed: " << e.what() << "\n";
++        return 3;
++    }
++    runtime->captureDecodingCUDAGraph(stream);
++
++    Server S;
++    S.args = args;
++    S.runtime = runtime.get();
++    S.stream = stream;
++
++    int const listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
++    if (listenFd < 0)
++    {
++        std::perror("socket");
++        return 2;
++    }
++    int one = 1;
++    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++    sockaddr_in addr{};
++    addr.sin_family = AF_INET;
++    addr.sin_port = htons(static_cast<uint16_t>(args.port));
++    if (::inet_pton(AF_INET, args.host.c_str(), &addr.sin_addr) != 1)
++    {
++        std::cerr << "bad --host\n";
++        return 2;
++    }
++    if (::bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(listenFd, 16) != 0)
++    {
++        std::perror("bind/listen");
++        return 2;
++    }
++    std::fprintf(stderr, "llm_server ready: http://%s:%d/v1  engine=%s spec=%s(topK %d, step %d, verify %d) maxTokens=%lld\n",
++        args.host.c_str(), args.port, args.engineDir.c_str(), args.specDecode ? "on" : "off", args.specDraftTopK,
++        args.specDraftStep, args.specVerifySize, static_cast<long long>(args.defaultMaxTokens));
++
++    while (true)
++    {
++        sockaddr_in peer{};
++        socklen_t plen = sizeof(peer);
++        int const fd = ::accept(listenFd, reinterpret_cast<sockaddr*>(&peer), &plen);
++        if (fd < 0)
++        {
++            continue;
++        }
++        std::thread(handleConnection, std::ref(S), fd).detach();
++    }
++}
 diff --git a/kernelSrcs/build_cutedsl.py b/kernelSrcs/build_cutedsl.py
 index 370fb6b..f6ae921 100644
 --- a/kernelSrcs/build_cutedsl.py
