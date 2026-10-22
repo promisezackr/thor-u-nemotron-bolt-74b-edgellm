@@ -16,7 +16,7 @@
 
 ## 2. 测试成绩
 
-条件：矿机等后台负载停止，greedy（temperature 0），输出 512 token，`--dflashBlockSize 6`，草稿 fold2（无相关性头）。
+条件：板子无其他 GPU 负载，greedy（temperature 0），输出 512 token，`--dflashBlockSize 6`，草稿 fold2（无相关性头）。
 
 ### 2.1 Edge-LLM `llm_inference`（不含 prefill）
 
