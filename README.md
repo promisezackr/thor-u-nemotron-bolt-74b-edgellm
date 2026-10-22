@@ -119,6 +119,8 @@ bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-128k /zeekr_data/llm/i
 
 服务请求示例：`POST /v1/chat/completions`，`{"model":"nemotron-bolt-74b","messages":[...],"max_tokens":512,"chat_template_kwargs":{"enable_thinking":false}}`，支持 `stream`。
 
+**思考模式**：模型是推理模型，聊天模板默认 `enable_thinking=True`；`server-bolt.sh` 默认带 `--defaultThinking`（第 4 个参数传 `nothink` 可关），每请求可用 `chat_template_kwargs.enable_thinking` 覆盖。流式下先推 `delta.reasoning_content` 再推 `delta.content`。代价：同一道推理题关思考 69 token / 1.8 s，开思考 351 token / 5.9 s（`deploy/think-compare.py`）；agent 场景建议开。
+
 **工具调用（function calling）**：`llm_server` 按模型聊天模板自动选择工具格式（`--toolFormat auto|nemotron|qwen`，检测到 `<function=` 即 Nemotron 格式）。Nemotron 3.5 的原生格式是 `<tool_call>\n<function=名>\n<parameter=键>\n值\n</parameter>\n</function>\n</tool_call>`：服务把 OpenAI `tools` 渲染成模板同样的 `<tools><function>...` system 段，把输出解析回标准 `tool_calls`（参数值能解析成 JSON 则按 JSON，否则按字符串），历史 `tool_calls` 与 `role: tool` 结果按模板格式回灌；流式模式下 `<tool_call>` 之后的文本不再作为 content 下发。回归脚本 `deploy/tools-test.py`（非流式 / 流式 / 工具结果回传三步）。用 Qwen 格式去驱动 Nemotron 会得到混合体（JSON 多出字段、括号不配对）而解析失败——这是接 coding agent（如 DeepSeek Harness）时"不兼容"的根因。
 
 注意事项：
