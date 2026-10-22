@@ -119,6 +119,8 @@ bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-128k /zeekr_data/llm/i
 
 服务请求示例：`POST /v1/chat/completions`，`{"model":"nemotron-bolt-74b","messages":[...],"max_tokens":512,"chat_template_kwargs":{"enable_thinking":false}}`，支持 `stream`。
 
+**工具调用（function calling）**：`llm_server` 按模型聊天模板自动选择工具格式（`--toolFormat auto|nemotron|qwen`，检测到 `<function=` 即 Nemotron 格式）。Nemotron 3.5 的原生格式是 `<tool_call>\n<function=名>\n<parameter=键>\n值\n</parameter>\n</function>\n</tool_call>`：服务把 OpenAI `tools` 渲染成模板同样的 `<tools><function>...` system 段，把输出解析回标准 `tool_calls`（参数值能解析成 JSON 则按 JSON，否则按字符串），历史 `tool_calls` 与 `role: tool` 结果按模板格式回灌；流式模式下 `<tool_call>` 之后的文本不再作为 content 下发。回归脚本 `deploy/tools-test.py`（非流式 / 流式 / 工具结果回传三步）。用 Qwen 格式去驱动 Nemotron 会得到混合体（JSON 多出字段、括号不配对）而解析失败——这是接 coding agent（如 DeepSeek Harness）时"不兼容"的根因。
+
 注意事项：
 - 板子默认账号 nvidia/nvidia（脚本中 `BOARD_SUDO_PW` 可覆盖）；本板无开机钩子，重启后需手动运行 `server-bolt.sh`，IP 10.0.0.3 会回退为默认 10.0.0.2。
 - 服务常驻占用约 46 GB GPU 内存；跑引擎构建或其他 GPU 任务前先 `pkill -x llm_server`。
@@ -132,3 +134,4 @@ bash /zeekr_data/llm/scripts/run-bolt-vision.sh bolt-spec-128k /zeekr_data/llm/i
 - `nemotron_h`：按层 MoE 配置（异构专家数）、DFlash 目标层捕获、NVFP4 A16 q/k/v 用 `qkv_concat`。
 - `llmBuilder.cpp`：DFlash 草稿 profile 最小行数；`dflashDecoder.cpp`：可选 LiLiCorr 相关性头走线（实测无增益，默认关闭）。
 - `llmRankRuntime.cpp`：分块 prefill（单请求、文本、vanilla/DFlash；草稿按块 round-0 prefill），`tensor.cpp`：reshape 失败打印张量名/容量。
+- `examples/llm/llm_server.cpp`：OpenAI 兼容服务（含 Nemotron 工具调用格式、流式 tool_call 拦截）。

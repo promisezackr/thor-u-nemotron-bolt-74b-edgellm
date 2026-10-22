@@ -739,10 +739,10 @@ index b4256f3..dd42f10 100644
                                           commonLibraryExt)
 diff --git a/examples/llm/llm_server.cpp b/examples/llm/llm_server.cpp
 new file mode 100755
-index 0000000..e9568da
+index 0000000..79e7016
 --- /dev/null
 +++ b/examples/llm/llm_server.cpp
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,1158 @@
 +/*
 + * llm_server: minimal OpenAI-compatible HTTP server on top of the TensorRT Edge-LLM runtime.
 + *
@@ -773,6 +773,9 @@ index 0000000..e9568da
 +#include <cstring>
 +#include <ctime>
 +#include <iostream>
++#include <iterator>
++#include <cctype>
++#include <fstream>
 +#include <memory>
 +#include <mutex>
 +#include <netinet/in.h>
@@ -804,6 +807,7 @@ index 0000000..e9568da
 +    int64_t defaultMaxTokens{1024};
 +    int64_t maxTokensCap{4096};
 +    int32_t streamInterval{1};
++    std::string toolFormat{"auto"}; // qwen | nemotron | auto (sniff chat_template.jinja for "<function=")
 +    bool defaultThinking{false};
 +};
 +
@@ -812,7 +816,7 @@ index 0000000..e9568da
 +    std::cerr << "Usage: " << argv0
 +              << " --engineDir DIR [--host 0.0.0.0] [--port 8081] [--model NAME] [--specDecode]"
 +                 " [--specDraftTopK N] [--specDraftStep N] [--specVerifySize N] [--dflashBlockSize N]"
-+                 " [--maxTokens N] [--maxTokensCap N] [--streamInterval N] [--defaultThinking]\n";
++                 " [--maxTokens N] [--maxTokensCap N] [--streamInterval N] [--defaultThinking] [--toolFormat qwen|nemotron|auto]\n";
 +}
 +
 +bool parseArgs(int argc, char** argv, Args& a)
@@ -853,6 +857,8 @@ index 0000000..e9568da
 +            a.maxTokensCap = std::stoll(v);
 +        else if (k == "--streamInterval" && next(v))
 +            a.streamInterval = std::stoi(v);
++        else if (k == "--toolFormat" && next(v))
++            a.toolFormat = v;
 +        else if (k == "--defaultThinking")
 +            a.defaultThinking = true;
 +        else if (k == "-h" || k == "--help")
@@ -1063,6 +1069,131 @@ index 0000000..e9568da
 +    return s;
 +}
 +
++// Tool-call wire format of the served model. Nemotron 3.5 (Bolt) renders tools as XML-ish <function>/<parameter>
++// blocks and expects calls as <tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>...</function>\n</tool_call>.
++bool gNemotronTools = false;
++
++std::string renderToolsSystemBlockNemotron(json const& tools)
++{
++    std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
++    for (auto const& t0 : tools)
++    {
++        json const& t = t0.contains("function") ? t0["function"] : t0;
++        s += "\n<function>\n<name>" + t.value("name", std::string()) + "</name>";
++        if (t.contains("description"))
++        {
++            s += "\n<description>" + t.value("description", std::string()) + "</description>";
++        }
++        s += "\n<parameters>";
++        json const params = t.value("parameters", json::object());
++        if (params.is_object() && params.contains("properties") && params["properties"].is_object())
++        {
++            for (auto it = params["properties"].begin(); it != params["properties"].end(); ++it)
++            {
++                json const& f = it.value();
++                s += "\n<parameter>\n<name>" + it.key() + "</name>";
++                if (f.contains("type"))
++                {
++                    s += "\n<type>" + (f["type"].is_string() ? f["type"].get<std::string>() : f["type"].dump()) + "</type>";
++                }
++                if (f.contains("description") && f["description"].is_string())
++                {
++                    s += "\n<description>" + f["description"].get<std::string>() + "</description>";
++                }
++                if (f.contains("enum"))
++                {
++                    s += "\n<enum>" + f["enum"].dump() + "</enum>";
++                }
++                for (auto jt = f.begin(); jt != f.end(); ++jt)
++                {
++                    std::string const k = jt.key();
++                    if (k == "name" || k == "type" || k == "description" || k == "enum")
++                    {
++                        continue;
++                    }
++                    s += "\n<" + k + ">" + (jt.value().is_string() ? jt.value().get<std::string>() : jt.value().dump()) + "</" + k + ">";
++                }
++                s += "\n</parameter>";
++            }
++        }
++        if (params.is_object() && params.contains("required"))
++        {
++            s += "\n<required>" + params["required"].dump() + "</required>";
++        }
++        s += "\n</parameters>\n</function>";
++    }
++    s += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
++         "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
++         "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
++         "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
++         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
++         "- Required parameters MUST be specified\n"
++         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
++         "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
++         "</IMPORTANT>";
++    return s;
++}
++
++// Assistant-history rendering of one call in Nemotron format (mirrors the chat template).
++std::string renderNemotronCall(std::string const& name, json const& args)
++{
++    std::string s = "<tool_call>\n<function=" + name + ">\n";
++    if (args.is_object())
++    {
++        for (auto it = args.begin(); it != args.end(); ++it)
++        {
++            std::string v = (it.value().is_string()) ? it.value().get<std::string>() : it.value().dump();
++            s += "<parameter=" + it.key() + ">\n" + v + "\n</parameter>\n";
++        }
++    }
++    s += "</function>\n</tool_call>\n";
++    return s;
++}
++
++// Parses "<function=NAME>...<parameter=K>\nV\n</parameter>...</function>" into {name, arguments}; false if no function tag.
++bool parseNemotronCall(std::string const& inner, json& call)
++{
++    size_t const f = inner.find("<function=");
++    if (f == std::string::npos)
++    {
++        return false;
++    }
++    size_t const nameEnd = inner.find('>', f + 10);
++    if (nameEnd == std::string::npos)
++    {
++        return false;
++    }
++    std::string name = inner.substr(f + 10, nameEnd - f - 10);
++    while (!name.empty() && (name.back() == ' ' || name.back() == '\n')) name.pop_back();
++    json args = json::object();
++    size_t pos = nameEnd + 1;
++    while (true)
++    {
++        size_t const p = inner.find("<parameter=", pos);
++        if (p == std::string::npos) break;
++        size_t const pe = inner.find('>', p + 11);
++        if (pe == std::string::npos) break;
++        std::string key = inner.substr(p + 11, pe - p - 11);
++        size_t const ve = inner.find("</parameter>", pe + 1);
++        if (ve == std::string::npos) break;
++        std::string val = inner.substr(pe + 1, ve - pe - 1);
++        if (!val.empty() && val.front() == '\n') val.erase(0, 1);
++        if (!val.empty() && val.back() == '\n') val.pop_back();
++        json parsed;
++        bool typed = false;
++        if (!val.empty() && (val.front() == '{' || val.front() == '[' || val == "true" || val == "false" || val == "null"
++                                || ((std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-') && val.find_first_not_of("-0123456789.eE") == std::string::npos)))
++        {
++            try { parsed = json::parse(val); typed = true; } catch (...) { typed = false; }
++        }
++        args[key] = typed ? parsed : json(val);
++        pos = ve + 12;
++    }
++    call["function"]["name"] = name;
++    call["function"]["arguments"] = args.dump();
++    return true;
++}
++
 +rt::Message textMessage(std::string const& role, std::string const& text)
 +{
 +    rt::Message m;
@@ -1126,11 +1257,12 @@ index 0000000..e9568da
 +                    {
 +                        call["arguments"] = args;
 +                    }
-+                    if (!text.empty())
++                    if (!text.empty() && text.back() != '\n')
 +                    {
 +                        text += "\n";
 +                    }
-+                    text += "<tool_call>\n" + call.dump() + "\n</tool_call>";
++                    text += gNemotronTools ? renderNemotronCall(call["name"].get<std::string>(), call["arguments"])
++                                           : "<tool_call>\n" + call.dump() + "\n</tool_call>";
 +                }
 +            }
 +            rest.push_back(textMessage("assistant", text));
@@ -1146,7 +1278,7 @@ index 0000000..e9568da
 +        {
 +            systemText += "\n\n";
 +        }
-+        systemText += renderToolsSystemBlock(body["tools"]);
++        systemText += gNemotronTools ? renderToolsSystemBlockNemotron(body["tools"]) : renderToolsSystemBlock(body["tools"]);
 +        haveSystem = true;
 +    }
 +    if (haveSystem)
@@ -1181,20 +1313,41 @@ index 0000000..e9568da
 +            break;
 +        }
 +        std::string inner = text.substr(a + open.size(), b - a - open.size());
-+        try
++        json call;
++        call["id"] = "call_" + std::to_string(calls.size() + 1);
++        call["type"] = "function";
++        if (parseNemotronCall(inner, call))
 +        {
-+            json j = json::parse(inner);
-+            json call;
-+            call["id"] = "call_" + std::to_string(calls.size() + 1);
-+            call["type"] = "function";
-+            call["function"]["name"] = j.value("name", "");
-+            json args = j.value("arguments", json::object());
-+            call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump();
 +            calls.push_back(call);
 +        }
-+        catch (...)
++        else
 +        {
-+            cleaned += text.substr(a, b + close.size() - a);
++            // JSON form ({"name":..,"arguments":{..}}); tolerate stray trailing braces/whitespace.
++            bool ok = false;
++            std::string candidate = inner;
++            for (int attempt = 0; attempt < 3 && !ok; ++attempt)
++            {
++                try
++                {
++                    json j = json::parse(candidate);
++                    call["function"]["name"] = j.value("name", "");
++                    json args = j.value("arguments", json::object());
++                    call["function"]["arguments"] = args.is_string() ? args.get<std::string>() : args.dump();
++                    calls.push_back(call);
++                    ok = true;
++                }
++                catch (...)
++                {
++                    size_t const last = candidate.find_last_of('}');
++                    if (last == std::string::npos || last == 0) break;
++                    candidate = candidate.substr(0, last); // drop one trailing brace and retry
++                    while (!candidate.empty() && std::isspace(static_cast<unsigned char>(candidate.back()))) candidate.pop_back();
++                }
++            }
++            if (!ok)
++            {
++                cleaned += text.substr(a, b + close.size() - a);
++            }
 +        }
 +        pos = b + close.size();
 +    }
@@ -1275,6 +1428,9 @@ index 0000000..e9568da
 +void handleChat(Server& S, int fd, json const& body)
 +{
 +    bool const streaming = body.value("stream", false);
++    bool const toolsPresent = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
++    bool toolMode = false;
++    std::string toolBuf;
 +    rt::LLMGenerationRequest req;
 +    rt::LLMGenerationRequest::Request r;
 +    r.messages = buildMessages(body);
@@ -1459,10 +1615,41 @@ index 0000000..e9568da
 +        std::string const deltaText = stripControlTokens(c.text);
 +        if (streaming && !clientGone && !deltaText.empty())
 +        {
-+            streamText(deltaText);
++            if (!toolsPresent)
++            {
++                streamText(deltaText);
++            }
++            else if (!toolMode)
++            {
++                // Hold back tool-call markup: once "<tool_call>" appears everything after it is parsed at the end
++                // and returned as tool_calls, never as content.
++                toolBuf += deltaText;
++                size_t const tp = toolBuf.find("<tool_call>");
++                if (tp != std::string::npos)
++                {
++                    toolMode = true;
++                    if (tp > 0) streamText(toolBuf.substr(0, tp));
++                    toolBuf.clear();
++                }
++                else
++                {
++                    size_t keep = 0;
++                    for (size_t k = std::min<size_t>(10, toolBuf.size()); k > 0; --k)
++                    {
++                        if (std::string("<tool_call>").compare(0, k, toolBuf.substr(toolBuf.size() - k)) == 0) { keep = k; break; }
++                    }
++                    if (toolBuf.size() > keep) streamText(toolBuf.substr(0, toolBuf.size() - keep));
++                    toolBuf = toolBuf.substr(toolBuf.size() - keep);
++                }
++            }
 +        }
 +    });
 +    worker.join();
++    if (streaming && !clientGone && toolsPresent && !toolMode && !toolBuf.empty())
++    {
++        streamText(toolBuf);
++        toolBuf.clear();
++    }
 +    if (reason == rt::FinishReason::kNotFinished && ch->isFinished())
 +    {
 +        reason = ch->getReason();
@@ -1658,6 +1845,17 @@ index 0000000..e9568da
 +    {
 +        std::cerr << "Runtime init failed: " << e.what() << "\n";
 +        return 3;
++    }
++    {
++        std::string fmt = args.toolFormat;
++        if (fmt == "auto")
++        {
++            std::ifstream tf(args.engineDir + "/chat_template.jinja");
++            std::string tpl((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
++            fmt = tpl.find("<function=") != std::string::npos ? "nemotron" : "qwen";
++        }
++        gNemotronTools = (fmt == "nemotron");
++        std::fprintf(stderr, "tool-call format: %s\n", fmt.c_str());
 +    }
 +    runtime->captureDecodingCUDAGraph(stream);
 +
